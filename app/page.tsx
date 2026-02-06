@@ -123,7 +123,7 @@ export default function Home() {
     message += `\n*GRAND TOTAL: ₹${grandTotal}*`;
     message += `\n\n_(Customer agreed to No Return Policy)_`;
 
-    window.open(`https://wa.me/918910436873?text=${encodeURIComponent(message)}`, '_blank');
+    window.open(`https://wa.me/917980125013?text=${encodeURIComponent(message)}`, '_blank');
     
     // Cleanup
     setCart([]); 
