@@ -25,7 +25,10 @@ export default function Home() {
   const [products, setProducts] = useState<Product[]>([]);
   const [userOrders, setUserOrders] = useState<Order[]>([]);
   const [cart, setCart] = useState<{ product: Product; qty: number }[]>([]);
+  
+  // 🛡️ SECURITY & UI STATES
   const [isLoading, setIsLoading] = useState(true);
+  const [isRedirecting, setIsRedirecting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   
   const [searchQuery, setSearchQuery] = useState("");
@@ -41,21 +44,17 @@ export default function Home() {
   const [checkoutStep, setCheckoutStep] = useState<'cart' | 'form'>('cart');
   const [formData, setFormData] = useState({ name: '', phone: '', address: '', pincode: '', utr: '' });
 
-  // DISCOUNT & FEES STATE
   const [couponCode, setCouponCode] = useState("");
   const [appliedCoupon, setAppliedCoupon] = useState<string | null>(null);
 
   const categories = ["all", "microcontrollers", "components", "tools", "kits", "projects"];
   
-  // PRICING MATH
   const subTotal = cart.reduce((sum, item) => sum + (item.product.price * item.qty), 0);
   const cartCount = cart.reduce((sum, item) => sum + item.qty, 0);
   
-  // 🛡️ FIX: Both fees become 0 if they cross the ₹200 threshold!
   const platformFee = subTotal > 0 && subTotal < MIN_ORDER_VALUE ? 10 : 0;
   const deliveryFee = subTotal > 0 && subTotal < MIN_ORDER_VALUE ? 10 : 0;
   
-  // 10% off up to ₹15 max limit (Zomato style psychology)
   let discountAmount = 0;
   if (appliedCoupon === 'CIRCUIT10' && subTotal >= 100) {
     discountAmount = Math.floor(Math.min(subTotal * 0.1, 15));
@@ -63,7 +62,6 @@ export default function Home() {
 
   const grandTotal = Math.max(0, subTotal + platformFee + deliveryFee - discountAmount);
 
-  // Remove coupon automatically if they remove items and drop below ₹100
   useEffect(() => {
     if (appliedCoupon && subTotal < 100) {
       setAppliedCoupon(null);
@@ -85,29 +83,41 @@ export default function Home() {
     }
   };
 
-  // INITIALIZATION & TAB RESTORATION
+  // 🛡️ SECURITY: BULLETPROOF AUTH INITIALIZATION
   useEffect(() => {
     const savedView = localStorage.getItem('circuit_cart_view');
     if (savedView === 'shop' || savedView === 'orders') setCurrentView(savedView);
 
     const init = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      setUser(session?.user ?? null);
+      const { data: { session }, error } = await supabase.auth.getSession();
+      
+      if (error || !session) {
+        setIsRedirecting(true);
+        router.replace('/auth');
+        return; 
+      }
+      
+      setUser(session.user);
       
       const { data: inventory } = await supabase.from('inventory').select('*').order('id', { ascending: true });
       if (inventory) setProducts(inventory as Product[]);
+      
       setIsLoading(false);
     };
+    
     init();
     
-    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => setUser(session?.user ?? null));
+    const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_OUT' || !session) {
+        setIsRedirecting(true);
+        router.replace('/auth');
+      } else {
+        setUser(session.user);
+      }
+    });
+    
     return () => authListener.subscription.unsubscribe();
-  }, []);
-
-  const switchView = (view: 'shop' | 'orders') => {
-    setCurrentView(view);
-    localStorage.setItem('circuit_cart_view', view);
-  };
+  }, [router]);
 
   useEffect(() => {
     if (user?.id) {
@@ -119,8 +129,20 @@ export default function Home() {
   }, [user?.id, currentView]);
 
   const fetchOrders = async () => {
-    const { data } = await supabase.from('orders').select('*').eq('user_id', user?.id).order('created_at', { ascending: false });
+    // Added error logging just in case RLS blocks the fetch
+    const { data, error } = await supabase.from('orders').select('*').eq('user_id', user?.id).order('created_at', { ascending: false });
+    if (error) {
+      console.error(error);
+      showToast("Could not sync orders.", "error");
+    }
     if (data) setUserOrders(data as Order[]);
+  };
+
+  // 🐛 BUG FIX: Automatically scroll to top when changing views so you don't stare at a blank screen!
+  const switchView = (view: 'shop' | 'orders') => {
+    setCurrentView(view);
+    localStorage.setItem('circuit_cart_view', view);
+    window.scrollTo({ top: 0, behavior: 'instant' }); 
   };
 
   const syncCart = async (newCart: any[]) => {
@@ -148,25 +170,28 @@ export default function Home() {
   };
 
   const confirmInternalOrder = async () => {
-    if (subTotal === 0) return;
+    if (subTotal === 0 || !user) return;
 
+    const cleanName = formData.name.trim();
+    const cleanPhone = formData.phone.replace(/[^0-9]/g, ''); 
+    const cleanAddress = formData.address.trim();
+    const cleanPincode = formData.pincode.replace(/[^0-9]/g, ''); 
     const cleanUtr = formData.utr.trim();
 
-    // 🛡️ SECURITY LAYER 1: STRICT 12-DIGIT VALIDATION
+    if (cleanName.length < 3) return showToast("Security: Provide a valid full name.", "error");
+    if (cleanPhone.length < 10) return showToast("Security: Provide a valid 10-digit phone number.", "error");
+    if (cleanAddress.length < 10) return showToast("Security: Delivery address is too short.", "error");
+    if (cleanPincode.length !== 6) return showToast("Security: Provide a valid 6-digit Pincode.", "error");
+
     const utrRegex = /^[0-9]{12}$/;
     if (!utrRegex.test(cleanUtr)) {
-      showToast("Invalid! UTR must be exactly 12 numeric digits.", "error");
+      showToast("Security: UTR must be exactly 12 numeric digits.", "error");
       return;
     }
 
     setIsSubmitting(true);
 
-    // 🛡️ SECURITY LAYER 2: DUPLICATE UTR BLOCKER
-    const { data: existingOrder } = await supabase
-      .from('orders')
-      .select('id')
-      .eq('customer_info->>utr', cleanUtr)
-      .maybeSingle();
+    const { data: existingOrder } = await supabase.from('orders').select('id').eq('customer_info->>utr', cleanUtr).maybeSingle();
 
     if (existingOrder) {
       showToast("Security Alert: This UTR has already been used!", "error");
@@ -174,12 +199,11 @@ export default function Home() {
       return;
     }
 
-    // 🛡️ IF SAFE, DISPATCH TO DATABASE
     const { error } = await supabase.from('orders').insert([{
-      user_id: user?.id,
+      user_id: user.id,
       items: cart,
       total: grandTotal,
-      customer_info: { ...formData, utr: cleanUtr, applied_coupon: appliedCoupon },
+      customer_info: { name: cleanName, phone: cleanPhone, address: cleanAddress, pincode: cleanPincode, utr: cleanUtr, applied_coupon: appliedCoupon },
       status: 'pending'
     }]);
 
@@ -190,15 +214,14 @@ export default function Home() {
     } else {
       showToast("Payment Verified & Order Dispatched!", "success");
       setCart([]); syncCart([]); setIsCartOpen(false); setIsOrderSummaryOpen(false); 
-      setFormData({...formData, utr: ''}); setAppliedCoupon(null); setCouponCode("");
+      setFormData({ name: '', phone: '', address: '', pincode: '', utr: '' }); 
+      setAppliedCoupon(null); setCouponCode("");
       switchView('orders');
     }
   };
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
-    setUser(null); setCart([]); setIsAccountOpen(false); switchView('shop');
-    window.location.reload();
   };
 
   const showToast = (msg: string, type: 'success' | 'error') => {
@@ -215,6 +238,26 @@ export default function Home() {
 
   const filteredProducts = products.filter(p => (activeCategory === 'all' || p.category.toLowerCase() === activeCategory) && p.name.toLowerCase().includes(searchQuery.toLowerCase()));
 
+  // 🛡️ SECURITY UI 1: REDIRECTING SCREEN
+  if (isRedirecting) {
+    return (
+      <div className="min-h-screen bg-[#020617] flex flex-col items-center justify-center space-y-4">
+        <i className="fas fa-shield-alt text-5xl text-amber-500 animate-pulse"></i>
+        <p className="text-slate-400 font-bold uppercase tracking-widest text-xs">Redirecting to Secure Gateway...</p>
+      </div>
+    );
+  }
+
+  // 🛡️ SECURITY UI 2: LOADING SCREEN
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-[#020617] flex flex-col items-center justify-center space-y-4">
+        <i className="fas fa-circle-notch fa-spin text-5xl text-amber-500"></i>
+        <p className="text-slate-400 font-bold uppercase tracking-widest text-xs animate-pulse">Establishing Secure Connection...</p>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen font-sans bg-[#020617] text-white overflow-x-hidden selection:bg-amber-500/30">
       
@@ -224,7 +267,7 @@ export default function Home() {
           
           <div className="flex items-center gap-2 md:gap-4 shrink-0">
             <button onClick={() => setIsMenuOpen(true)} className="md:hidden text-white text-2xl p-2 active:scale-90"><i className="fas fa-bars"></i></button>
-            <div className="cursor-pointer" onClick={() => {switchView('shop'); window.scrollTo(0,0);}}>
+            <div className="cursor-pointer" onClick={() => switchView('shop')}>
               <span className="text-xl md:text-2xl font-black uppercase tracking-tight">Circuit<span className="text-amber-500">Cart</span></span>
             </div>
           </div>
@@ -235,15 +278,17 @@ export default function Home() {
           </div>
 
           <div className="flex items-center gap-4 md:gap-8 shrink-0 relative">
-            <div className="hidden md:block leading-tight cursor-pointer" onClick={() => user ? setIsAccountOpen(!isAccountOpen) : router.push('/auth')}>
-              <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Hello, {user?.user_metadata?.display_name || 'Sign In'}</p>
+            <div className="hidden md:block leading-tight cursor-pointer" onClick={() => setIsAccountOpen(!isAccountOpen)}>
+              <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Hello, {user?.user_metadata?.display_name || 'Operator'}</p>
               <p className="text-sm font-bold uppercase">Account Hub <i className="fas fa-caret-down text-[10px] ml-1"></i></p>
             </div>
             
             {isAccountOpen && user && (
               <div className="absolute top-16 right-0 w-64 bg-[#131921] border border-slate-700 rounded-xl shadow-2xl p-4 z-[70] animate-pop-in">
-                <button onClick={() => {switchView('orders'); setIsAccountOpen(false);}} className="w-full text-left text-sm font-bold p-3 hover:text-amber-500 border-b border-slate-800">My Orders</button>
-                <button onClick={handleLogout} className="w-full bg-slate-800 text-red-500 font-bold py-2 rounded-lg mt-3 text-xs uppercase">Sign Out</button>
+                <button onClick={() => {switchView('orders'); setIsAccountOpen(false);}} className="w-full text-left text-sm font-bold p-3 hover:text-amber-500 border-b border-slate-800 flex items-center gap-2">
+                   <i className="fas fa-box text-slate-500"></i> My Orders
+                </button>
+                <button onClick={handleLogout} className="w-full bg-slate-800 text-red-500 font-bold py-2 rounded-lg mt-3 text-xs uppercase hover:bg-slate-700 transition-colors">Sign Out</button>
               </div>
             )}
 
@@ -254,7 +299,6 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Mobile Search Bar Row */}
         <div className="md:hidden px-4 pb-3">
           <div className="flex h-10 overflow-hidden rounded-lg shadow-inner">
             <input type="text" className="flex-1 px-4 text-slate-900 bg-white outline-none text-sm font-semibold" placeholder="Search..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
@@ -262,7 +306,6 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Desktop Category Bar */}
         <div className="hidden md:flex bg-[#232f3e] border-t border-slate-700/50 h-10 items-center justify-center gap-8 text-xs font-bold uppercase tracking-wider">
           {categories.map(cat => (
             <span key={cat} onClick={() => {setActiveCategory(cat); switchView('shop');}} className={`cursor-pointer px-3 py-1 rounded transition-colors ${activeCategory === cat ? 'bg-amber-500 text-slate-900' : 'text-slate-300 hover:text-white'}`}>{cat}</span>
@@ -282,7 +325,7 @@ export default function Home() {
               </div>
               <div>
                 <p className="text-sm font-bold uppercase text-white leading-none mb-1">HELLO,</p>
-                <p className="text-xl font-bold text-amber-500 line-clamp-1 leading-none">{user ? user.user_metadata?.display_name : 'Sign In'}</p>
+                <p className="text-xl font-bold text-amber-500 line-clamp-1 leading-none">{user ? user.user_metadata?.display_name : 'Operator'}</p>
               </div>
             </div>
 
@@ -299,7 +342,10 @@ export default function Home() {
               <div className="border-t border-slate-800 pt-6 shrink-0 mb-4">
                 <h3 className="text-xs font-black uppercase text-slate-400 mb-5 tracking-widest">Settings</h3>
                 <ul className="space-y-6 text-base font-bold text-slate-200">
-                  <li className="cursor-pointer" onClick={() => {switchView('orders'); setIsMenuOpen(false);}}>Your Account</li>
+                  {/* 🐛 UX FIX: CLEARLY LABELLED AS MY ORDERS ON MOBILE */}
+                  <li className="cursor-pointer flex items-center gap-3 hover:text-amber-500 transition-colors" onClick={() => {switchView('orders'); setIsMenuOpen(false);}}>
+                    <i className="fas fa-box text-slate-400"></i> My Orders
+                  </li>
                   {user && (
                     <li className="text-red-500 cursor-pointer flex items-center gap-3" onClick={handleLogout}>
                       <span className="flex items-center justify-center w-7 h-7 rounded-full border border-red-500 text-xs font-black">N</span>
@@ -317,9 +363,7 @@ export default function Home() {
       <div className="container mx-auto pt-36 md:pt-44 px-4 pb-24 max-w-6xl">
         {currentView === 'shop' ? (
           <main className="space-y-4 md:space-y-5 animate-pop-in">
-            {isLoading ? (
-               <div className="py-24 text-center"><i className="fas fa-circle-notch fa-spin text-4xl text-amber-500"></i></div>
-            ) : filteredProducts.map(p => (
+            {filteredProducts.map(p => (
               <div key={p.id} className="bg-slate-900/40 border border-slate-800 rounded-xl overflow-hidden flex flex-row shadow-lg min-h-[160px] md:min-h-[200px] will-change-transform">
                 <div className="w-32 md:w-56 bg-slate-800/30 flex items-center justify-center p-4 cursor-pointer shrink-0" onClick={() => setSelectedProduct(p)}>
                   <img src={p.image} className="max-h-24 md:max-h-36 object-contain blend-image" alt={p.name} />
@@ -349,7 +393,10 @@ export default function Home() {
             </div>
             
             {userOrders.length === 0 ? (
-              <div className="py-20 text-center opacity-30 uppercase font-bold tracking-widest">No Active Shipment Signals</div>
+              <div className="py-20 text-center opacity-30 uppercase font-bold tracking-widest flex flex-col items-center">
+                 <i className="fas fa-box-open text-4xl mb-4"></i>
+                 No Active Shipment Signals
+              </div>
             ) : userOrders.map(order => (
               <div key={order.id} className="bg-[#131921] border border-slate-800 rounded-2xl p-6 mb-8 shadow-2xl will-change-transform">
                 <div className="flex flex-col md:flex-row justify-between mb-8 text-xs font-bold uppercase gap-4">
@@ -387,7 +434,6 @@ export default function Home() {
               <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-5">
                  <h3 className="text-xs font-black uppercase text-slate-500 mb-4 tracking-widest">Bill Details</h3>
                  
-                 {/* ZOMATO STYLE ITEMISED BILL RECEIPT */}
                  <div className="space-y-3 mb-4 border-b border-slate-700/50 pb-4">
                    {cart.map(item => (
                      <div key={item.product.id} className="flex justify-between text-xs md:text-sm">
@@ -400,7 +446,6 @@ export default function Home() {
                  <div className="space-y-2 text-xs text-slate-400 font-medium">
                    <div className="flex justify-between"><span>Item Total</span><span className="text-white">₹{subTotal}</span></div>
                    
-                   {/* 🛡️ BOTH FEES SHOW AS STRUCK OUT WHEN CART IS OVER ₹200 */}
                    <div className="flex justify-between">
                      <span>Platform Fee</span>
                      {platformFee === 0 && subTotal > 0 ? (
@@ -433,7 +478,6 @@ export default function Home() {
                  </div>
               </div>
 
-              {/* LIVE PHONEPE UPI VERIFICATION SECTION */}
               <div className="bg-amber-500/5 border border-amber-500/30 rounded-xl p-6 text-center space-y-5">
                  <h3 className="text-sm font-black uppercase text-amber-500 tracking-widest">Complete Your Payment</h3>
                  
@@ -518,7 +562,6 @@ export default function Home() {
                     ))}
                   </div>
 
-                  {/* ZOMATO STYLE COUPON SECTION */}
                   {cart.length > 0 && (
                     <div className="mt-8 border border-dashed border-amber-500/50 bg-amber-500/5 rounded-xl p-4">
                       <div className="flex items-center gap-2 text-amber-500 mb-3 text-sm font-bold">
@@ -551,7 +594,6 @@ export default function Home() {
                     </div>
                   )}
 
-                  {/* MINI BILL SUMMARY FOR CART VIEW */}
                   {cart.length > 0 && (
                     <div className="mt-6 space-y-2 text-xs text-slate-400 border-t border-slate-800 pt-6">
                        <div className="flex justify-between"><span>Item Total</span><span className="text-white">₹{subTotal}</span></div>
@@ -570,12 +612,24 @@ export default function Home() {
               ) : (
                 <div className="space-y-5">
                   <h3 className="text-sm font-bold uppercase text-amber-500 mb-4 border-b border-slate-700 pb-2">Delivery Information</h3>
-                  {['name', 'phone', 'address', 'pincode'].map(f => (
-                    <div key={f}>
-                      <label className="block text-xs font-bold text-slate-400 uppercase mb-1">{f}</label>
-                      <input type="text" className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors" value={(formData as any)[f]} onChange={e => setFormData({...formData, [f]: e.target.value})} />
-                    </div>
-                  ))}
+                  
+                  <div>
+                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Target (Name)</label>
+                    <input type="text" placeholder="Full Name" className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Signal (Phone)</label>
+                    <input type="text" maxLength={10} placeholder="10-Digit Mobile" className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors" value={formData.phone} onChange={e => setFormData({...formData, phone: e.target.value.replace(/[^0-9]/g, '')})} />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Coordinate (Address)</label>
+                    <textarea placeholder="Complete Delivery Address" className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors h-24" value={formData.address} onChange={e => setFormData({...formData, address: e.target.value})}></textarea>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-400 uppercase mb-1">Pincode</label>
+                    <input type="text" maxLength={6} placeholder="6-Digit PIN" className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors" value={formData.pincode} onChange={e => setFormData({...formData, pincode: e.target.value.replace(/[^0-9]/g, '')})} />
+                  </div>
+
                 </div>
               )}
             </div>
@@ -586,7 +640,7 @@ export default function Home() {
                     <span className="text-slate-400 text-sm uppercase font-bold">To Pay</span>
                     <span className="text-2xl font-black text-white">₹{grandTotal}</span>
                   </div>
-                  <button onClick={() => user ? (checkoutStep === 'cart' ? setCheckoutStep('form') : setIsOrderSummaryOpen(true)) : router.push('/auth')} className="w-full py-4 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-lg text-sm md:text-xs uppercase tracking-wider transition-transform active:scale-95 shadow-xl">
+                  <button onClick={() => checkoutStep === 'cart' ? setCheckoutStep('form') : setIsOrderSummaryOpen(true)} className="w-full py-4 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-lg text-sm md:text-xs uppercase tracking-wider transition-transform active:scale-95 shadow-xl">
                     {checkoutStep === 'cart' ? 'Proceed to Checkout' : 'Review Final Order'}
                   </button>
                   {checkoutStep === 'form' && (
