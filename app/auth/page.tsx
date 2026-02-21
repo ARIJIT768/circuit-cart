@@ -33,13 +33,7 @@ export default function AuthPage() {
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(cleanEmail)) return "Please enter a valid secure comms address (Email).";
 
-    // ANTI-GENERIC EMAIL PROTOCOL
-    const blockedDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com'];
-    const emailDomain = cleanEmail.split('@')[1];
-    
-    if (blockedDomains.includes(emailDomain)) {
-      return "Generic providers restricted. Please use an official organizational email.";
-    }
+    // Note: The Gmail blocklist has been completely removed!
     
     return null;
   };
@@ -165,12 +159,12 @@ export default function AuthPage() {
             )}
 
             <div className="space-y-2">
-              <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest">Organizational Address (Email)</label>
+              <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest">Comms Address (Email)</label>
               <input 
                 type="email" 
                 required 
                 className="w-full p-4 rounded-xl bg-[#020617] text-white border border-slate-700 focus:border-amber-500 outline-none transition-colors font-bold text-sm shadow-inner placeholder:text-slate-600"
-                placeholder="operator@company.com"
+                placeholder="operator@network.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
               />
