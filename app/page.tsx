@@ -14,6 +14,7 @@ export interface Product {
   desc: string;
   details: string;
   discount?: string;
+  stock: number;
 }
 
 export interface Order {
@@ -25,19 +26,40 @@ export interface Order {
   items: { product: Product; qty: number }[];
 }
 
+export interface Review {
+  id: string;
+  product_id: number;
+  user_name: string;
+  rating: number;
+  comment: string;
+  image_url?: string;
+  created_at: string;
+}
+
 const MIN_ORDER_VALUE = 200;
 
 export default function Home() {
   const router = useRouter();
 
-  // 1. STATE & LOGIC
   const [user, setUser] = useState<User | null>(null);
   const [currentView, setCurrentView] = useState<'shop' | 'orders'>('shop');
   const [products, setProducts] = useState<Product[]>([]);
   const [userOrders, setUserOrders] = useState<Order[]>([]);
   const [cart, setCart] = useState<{ product: Product; qty: number }[]>([]);
 
-  // 🛡️ SECURITY & UI STATES
+  const [allReviews, setAllReviews] = useState<
+    { product_id: number; rating: number }[]
+  >([]);
+  const [sortBy, setSortBy] = useState<
+    'featured' | 'price-asc' | 'price-desc' | 'rating-desc'
+  >('featured');
+  const [isSupportOpen, setIsSupportOpen] = useState(false);
+  const [reviews, setReviews] = useState<Review[]>([]);
+  const [isReviewModalOpen, setIsReviewModalOpen] = useState(false);
+  const [reviewForm, setReviewForm] = useState({ rating: 5, comment: '' });
+  const [reviewFile, setReviewFile] = useState<File | null>(null);
+  const [isSubmittingReview, setIsSubmittingReview] = useState(false);
+
   const [isLoading, setIsLoading] = useState(true);
   const [isRedirecting, setIsRedirecting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -63,6 +85,8 @@ export default function Home() {
     pincode: '',
     utr: '',
   });
+  const [receiptFile, setReceiptFile] = useState<File | null>(null);
+  const [agreedToTerms, setAgreedToTerms] = useState(false);
 
   const [couponCode, setCouponCode] = useState('');
   const [appliedCoupon, setAppliedCoupon] = useState<string | null>(null);
@@ -81,7 +105,6 @@ export default function Home() {
     0,
   );
   const cartCount = cart.reduce((sum, item) => sum + item.qty, 0);
-
   const platformFee = subTotal > 0 && subTotal < MIN_ORDER_VALUE ? 10 : 0;
   const deliveryFee = subTotal > 0 && subTotal < MIN_ORDER_VALUE ? 10 : 0;
 
@@ -89,11 +112,13 @@ export default function Home() {
   if (appliedCoupon === 'CIRCUIT10' && subTotal >= 100) {
     discountAmount = Math.floor(Math.min(subTotal * 0.1, 15));
   }
-
   const grandTotal = Math.max(
     0,
     subTotal + platformFee + deliveryFee - discountAmount,
   );
+
+  const upiLink = `upi://pay?pa=9547543695@axl&pn=Circuit%20Cart&am=${grandTotal}&cu=INR`;
+  const dynamicQrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(upiLink)}&margin=10`;
 
   useEffect(() => {
     if (appliedCoupon && subTotal < 100) {
@@ -116,7 +141,6 @@ export default function Home() {
     }
   };
 
-  // 🛡️ SECURITY: BULLETPROOF AUTH INITIALIZATION
   useEffect(() => {
     const savedView = localStorage.getItem('circuit_cart_view');
     if (savedView === 'shop' || savedView === 'orders')
@@ -127,7 +151,6 @@ export default function Home() {
         data: { session },
         error,
       } = await supabase.auth.getSession();
-
       if (error || !session) {
         setIsRedirecting(true);
         router.replace('/auth');
@@ -136,11 +159,28 @@ export default function Home() {
 
       setUser(session.user);
 
+      const { data: profileData } = await supabase
+        .from('profiles')
+        .select('checkout_info')
+        .eq('id', session.user.id)
+        .single();
+      if (
+        profileData?.checkout_info &&
+        Object.keys(profileData.checkout_info).length > 0
+      ) {
+        setFormData((prev) => ({ ...prev, ...profileData.checkout_info }));
+      }
+
       const { data: inventory } = await supabase
         .from('inventory')
         .select('*')
         .order('id', { ascending: true });
       if (inventory) setProducts(inventory as Product[]);
+
+      const { data: reviewsData } = await supabase
+        .from('reviews')
+        .select('product_id, rating');
+      if (reviewsData) setAllReviews(reviewsData);
 
       setIsLoading(false);
     };
@@ -171,25 +211,19 @@ export default function Home() {
         .then(({ data }) => {
           if (data?.cart_data) setCart(data.cart_data);
         });
-      if (currentView === 'orders') fetchOrders();
+      fetchOrders();
     }
-  }, [user?.id, currentView]);
+  }, [user?.id]);
 
   const fetchOrders = async () => {
-    // Added error logging just in case RLS blocks the fetch
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('orders')
       .select('*')
       .eq('user_id', user?.id)
       .order('created_at', { ascending: false });
-    if (error) {
-      console.error(error);
-      showToast('Could not sync orders.', 'error');
-    }
     if (data) setUserOrders(data as Order[]);
   };
 
-  // 🐛 BUG FIX: Automatically scroll to top when changing views so you don't stare at a blank screen!
   const switchView = (view: 'shop' | 'orders') => {
     setCurrentView(view);
     localStorage.setItem('circuit_cart_view', view);
@@ -204,7 +238,7 @@ export default function Home() {
   };
 
   const getProgressWidth = (order: Order) => {
-    if (order.status === 'rejected') return '100%'; 
+    if (order.status === 'rejected') return '100%';
     if (order.status === 'delivered') return '100%';
     if (order.status === 'shipped') return '75%';
     if (order.status === 'confirmed') return '45%';
@@ -212,7 +246,21 @@ export default function Home() {
   };
 
   const addToCart = (product: Product) => {
+    // 🟢 NEW: Custom Project Override
+    if (product.id === 32)
+      return showToast('Custom Projects require consultation first.', 'error');
+    if (product.stock < 1)
+      return showToast('Item completely sold out!', 'error');
+
     const existing = cart.find((item) => item.product.id === product.id);
+
+    if (existing && existing.qty >= product.stock) {
+      return showToast(
+        `Stock limit reached. Only ${product.stock} available.`,
+        'error',
+      );
+    }
+
     const newCart = existing
       ? cart.map((item) =>
           item.product.id === product.id
@@ -226,11 +274,20 @@ export default function Home() {
   };
 
   const updateQty = (id: number, delta: number) => {
-    const newCart = cart.map((item) =>
-      item.product.id === id
-        ? { ...item, qty: Math.max(1, item.qty + delta) }
-        : item,
-    );
+    const newCart = cart.map((item) => {
+      if (item.product.id === id) {
+        const newQty = item.qty + delta;
+        if (newQty > item.product.stock) {
+          showToast(
+            `Cannot exceed stock limit (${item.product.stock})`,
+            'error',
+          );
+          return { ...item, qty: item.product.stock };
+        }
+        return { ...item, qty: Math.max(1, newQty) };
+      }
+      return item;
+    });
     setCart(newCart);
     syncCart(newCart);
   };
@@ -241,84 +298,86 @@ export default function Home() {
     syncCart(newCart);
   };
 
-  // 🛡️ HARDENED RECEIPT UPLOAD PROTOCOL
-  const [receiptFile, setReceiptFile] = useState<File | null>(null);
-
   const confirmInternalOrder = async () => {
     if (subTotal === 0 || !user) return;
-
-    // 1. Mandatory Receipt Check
-    if (!receiptFile) {
+    if (!agreedToTerms)
+      return showToast(
+        'Security Error: You must accept the Terms and Conditions to proceed.',
+        'error',
+      );
+    if (!receiptFile)
       return showToast(
         'Security Error: Payment receipt screenshot required.',
         'error',
       );
-    }
 
     const cleanUtr = formData.utr.trim();
-    const utrRegex = /^[0-9]{12}$/;
-    if (!utrRegex.test(cleanUtr)) {
+    if (!/^[0-9]{12}$/.test(cleanUtr))
       return showToast('Security Error: 12-digit UTR is required.', 'error');
-    }
 
     setIsSubmitting(true);
 
     try {
-      // 2. CHECK FOR REUSED UTR (DATABASE CROSS-CHECK)
       const { data: duplicateOrder } = await supabase
         .from('orders')
         .select('id')
         .eq('customer_info->>utr', cleanUtr)
         .maybeSingle();
-
       if (duplicateOrder) {
         showToast('Fraud Alert: This UTR has already been used!', 'error');
         setIsSubmitting(false);
         return;
       }
 
-      // 3. UPLOAD TO SUPABASE STORAGE
       const fileExt = receiptFile.name.split('.').pop();
-      const fileName = `${user.id}-${Date.now()}.${fileExt}`;
-      const filePath = `receipts/${fileName}`;
-
+      const filePath = `receipts/${user.id}-${Date.now()}.${fileExt}`;
       const { error: uploadError } = await supabase.storage
         .from('payment-receipts')
         .upload(filePath, receiptFile);
-
       if (uploadError)
         throw new Error('Storage Error: Failed to upload receipt.');
 
-      // 4. GENERATE PUBLIC URL
       const {
         data: { publicUrl },
       } = supabase.storage.from('payment-receipts').getPublicUrl(filePath);
 
-      // 5. DISPATCH ORDER WITH RECEIPT URL
       const { error } = await supabase.from('orders').insert([
         {
           user_id: user.id,
           items: cart,
           total: grandTotal,
+          status: 'pending',
           customer_info: {
             ...formData,
             utr: cleanUtr,
-            receipt_url: publicUrl, // 🛡️ Encrypted link to screenshot
+            receipt_url: publicUrl,
             applied_coupon: appliedCoupon,
           },
-          status: 'pending',
         },
       ]);
 
       if (error) throw error;
+
+      const addressToSave = {
+        name: formData.name,
+        phone: formData.phone,
+        address: formData.address,
+        pincode: formData.pincode,
+      };
+      supabase
+        .from('profiles')
+        .update({ checkout_info: addressToSave })
+        .eq('id', user.id)
+        .then();
 
       showToast('Signal Received: Verification in progress.', 'success');
       setCart([]);
       syncCart([]);
       setIsCartOpen(false);
       setIsOrderSummaryOpen(false);
-      setReceiptFile(null); // Clear for next order
-      setFormData({ name: '', phone: '', address: '', pincode: '', utr: '' });
+      setReceiptFile(null);
+      setAgreedToTerms(false);
+      setFormData((prev) => ({ ...prev, utr: '' }));
       switchView('orders');
     } catch (err: any) {
       showToast(err.message || 'Logistics Failure.', 'error');
@@ -327,49 +386,152 @@ export default function Home() {
     }
   };
 
+  const getProductRating = (productId: number) => {
+    const productReviews = allReviews.filter((r) => r.product_id === productId);
+    if (productReviews.length === 0) return { avg: 0, count: 0 };
+    const sum = productReviews.reduce((acc, r) => acc + r.rating, 0);
+    return {
+      avg: Number((sum / productReviews.length).toFixed(1)),
+      count: productReviews.length,
+    };
+  };
+
+  const renderStars = (productId: number) => {
+    const { avg, count } = getProductRating(productId);
+    if (count === 0) return <div className='h-4 mb-2'></div>;
+
+    const fullStars = Math.floor(avg);
+    const hasHalfStar = avg % 1 >= 0.5;
+    const emptyStars = 5 - fullStars - (hasHalfStar ? 1 : 0);
+
+    return (
+      <div className='flex items-center gap-1 text-amber-400 text-[10px] md:text-xs mb-2'>
+        <span className='text-white font-bold mr-1'>{avg}</span>
+        {[...Array(fullStars)].map((_, i) => (
+          <i key={`f-${i}`} className='fas fa-star'></i>
+        ))}
+        {hasHalfStar && <i className='fas fa-star-half-alt'></i>}
+        {[...Array(emptyStars)].map((_, i) => (
+          <i key={`e-${i}`} className='far fa-star text-slate-600'></i>
+        ))}
+        <span className='text-slate-400 ml-1 font-semibold'>({count})</span>
+      </div>
+    );
+  };
+
+  const openProductModal = async (p: Product) => {
+    setSelectedProduct(p);
+    const { data } = await supabase
+      .from('reviews')
+      .select('*')
+      .eq('product_id', p.id)
+      .order('created_at', { ascending: false });
+    if (data) setReviews(data as Review[]);
+  };
+
+  const checkCanReview = (productId: number) => {
+    return userOrders.some(
+      (order) =>
+        order.status === 'delivered' &&
+        order.items.some((item) => item.product.id === productId),
+    );
+  };
+
+  const handleSubmitReview = async () => {
+    if (!selectedProduct || !user) return;
+    if (reviewForm.rating < 1 || reviewForm.rating > 5)
+      return showToast('Invalid rating', 'error');
+
+    setIsSubmittingReview(true);
+    try {
+      let imageUrl = null;
+      if (reviewFile) {
+        const fileExt = reviewFile.name.split('.').pop();
+        const filePath = `reviews/${user.id}-${Date.now()}.${fileExt}`;
+        const { error: uploadError } = await supabase.storage
+          .from('review-images')
+          .upload(filePath, reviewFile);
+        if (uploadError) throw new Error('Image upload failed');
+
+        const { data } = supabase.storage
+          .from('review-images')
+          .getPublicUrl(filePath);
+        imageUrl = data.publicUrl;
+      }
+
+      const { error } = await supabase.from('reviews').insert([
+        {
+          product_id: selectedProduct.id,
+          user_id: user.id,
+          user_name: user.user_metadata?.display_name || 'Anonymous Operator',
+          rating: reviewForm.rating,
+          comment: reviewForm.comment,
+          image_url: imageUrl,
+        },
+      ]);
+
+      if (error) throw error;
+
+      setAllReviews((prev) => [
+        ...prev,
+        { product_id: selectedProduct.id, rating: reviewForm.rating },
+      ]);
+      showToast('Review published successfully!', 'success');
+      setIsReviewModalOpen(false);
+      setReviewForm({ rating: 5, comment: '' });
+      setReviewFile(null);
+      openProductModal(selectedProduct);
+    } catch (e: any) {
+      showToast(e.message, 'error');
+    } finally {
+      setIsSubmittingReview(false);
+    }
+  };
+
   const handleLogout = async () => {
     await supabase.auth.signOut();
   };
-
   const showToast = (msg: string, type: 'success' | 'error') => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3000);
   };
 
-  const filteredProducts = products.filter(
-    (p) =>
-      (activeCategory === 'all' ||
-        p.category.toLowerCase() === activeCategory) &&
-      p.name.toLowerCase().includes(searchQuery.toLowerCase()),
-  );
+  const filteredAndSortedProducts = products
+    .filter(
+      (p) =>
+        (activeCategory === 'all' ||
+          p.category.toLowerCase() === activeCategory) &&
+        p.name.toLowerCase().includes(searchQuery.toLowerCase()),
+    )
+    .sort((a, b) => {
+      if (sortBy === 'price-asc') return a.price - b.price;
+      if (sortBy === 'price-desc') return b.price - a.price;
+      if (sortBy === 'rating-desc')
+        return getProductRating(b.id).avg - getProductRating(a.id).avg;
+      return 0;
+    });
 
-  // 🛡️ SECURITY UI 1: REDIRECTING SCREEN
-  if (isRedirecting) {
+  if (isRedirecting)
     return (
       <div className='min-h-screen bg-[#020617] flex flex-col items-center justify-center space-y-4'>
         <i className='fas fa-shield-alt text-5xl text-amber-500 animate-pulse'></i>
         <p className='text-slate-400 font-bold uppercase tracking-widest text-xs'>
-          Redirecting to Secure Gateway...
+          Redirecting...
         </p>
       </div>
     );
-  }
-
-  // 🛡️ SECURITY UI 2: LOADING SCREEN
-  if (isLoading) {
+  if (isLoading)
     return (
       <div className='min-h-screen bg-[#020617] flex flex-col items-center justify-center space-y-4'>
         <i className='fas fa-circle-notch fa-spin text-5xl text-amber-500'></i>
         <p className='text-slate-400 font-bold uppercase tracking-widest text-xs animate-pulse'>
-          Establishing Secure Connection...
+          Establishing Connection...
         </p>
       </div>
     );
-  }
 
   return (
     <div className='min-h-screen font-sans bg-[#020617] text-white overflow-x-hidden selection:bg-amber-500/30'>
-      {/* 1. HEADER */}
       <header className='fixed w-full z-50 bg-[#131921] shadow-2xl border-b border-slate-800'>
         <div className='max-w-7xl mx-auto px-4 md:px-6 h-16 md:h-20 flex items-center justify-between gap-4 md:gap-8'>
           <div className='flex items-center gap-2 md:gap-4 shrink-0'>
@@ -422,6 +584,15 @@ export default function Home() {
                   <i className='fas fa-box text-slate-500'></i> My Orders
                 </button>
                 <button
+                  onClick={() => {
+                    setIsSupportOpen(true);
+                    setIsAccountOpen(false);
+                  }}
+                  className='w-full text-left text-sm font-bold p-3 hover:text-amber-500 border-b border-slate-800 flex items-center gap-2'>
+                  <i className='fas fa-headset text-slate-500'></i> Support &
+                  Help
+                </button>
+                <button
                   onClick={handleLogout}
                   className='w-full bg-slate-800 text-red-500 font-bold py-2 rounded-lg mt-3 text-xs uppercase hover:bg-slate-700 transition-colors'>
                   Sign Out
@@ -457,7 +628,7 @@ export default function Home() {
           </div>
         </div>
 
-        <div className='hidden md:flex bg-[#232f3e] border-t border-slate-700/50 h-10 items-center justify-center gap-8 text-xs font-bold uppercase tracking-wider'>
+        <div className='hidden md:flex bg-[#232f3e] border-t border-slate-700/50 h-10 items-center justify-center gap-8 text-xs font-bold uppercase tracking-wider relative'>
           {categories.map((cat) => (
             <span
               key={cat}
@@ -469,10 +640,32 @@ export default function Home() {
               {cat}
             </span>
           ))}
+          <div className='absolute right-6 flex items-center'>
+            <div className='flex items-center bg-[#020617] border border-slate-700 rounded-lg px-3 py-1.5 focus-within:border-amber-500 transition-all shadow-inner group'>
+              <i className='fas fa-sort-amount-down text-amber-500 text-[10px] mr-2'></i>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as any)}
+                className='bg-transparent text-white font-bold text-[10px] uppercase tracking-widest outline-none cursor-pointer appearance-none pr-4'>
+                <option value='featured' className='bg-[#131921] text-white'>
+                  Featured
+                </option>
+                <option value='price-asc' className='bg-[#131921] text-white'>
+                  Price: Low to High
+                </option>
+                <option value='price-desc' className='bg-[#131921] text-white'>
+                  Price: High to Low
+                </option>
+                <option value='rating-desc' className='bg-[#131921] text-white'>
+                  Top Rated
+                </option>
+              </select>
+              <i className='fas fa-chevron-down text-slate-500 group-hover:text-amber-500 transition-colors text-[9px] pointer-events-none -ml-2'></i>
+            </div>
+          </div>
         </div>
       </header>
 
-      {/* 2. MOBILE HAMBURGER MENU */}
       {isMenuOpen && (
         <div className='fixed inset-0 z-[100] flex md:hidden'>
           <div
@@ -519,7 +712,6 @@ export default function Home() {
                   Settings
                 </h3>
                 <ul className='space-y-6 text-base font-bold text-slate-200'>
-                  {/* 🐛 UX FIX: CLEARLY LABELLED AS MY ORDERS ON MOBILE */}
                   <li
                     className='cursor-pointer flex items-center gap-3 hover:text-amber-500 transition-colors'
                     onClick={() => {
@@ -528,13 +720,22 @@ export default function Home() {
                     }}>
                     <i className='fas fa-box text-slate-400'></i> My Orders
                   </li>
+                  <li
+                    className='cursor-pointer flex items-center gap-3 hover:text-amber-500 transition-colors'
+                    onClick={() => {
+                      setIsSupportOpen(true);
+                      setIsMenuOpen(false);
+                    }}>
+                    <i className='fas fa-headset text-slate-400'></i> Support &
+                    Help
+                  </li>
                   {user && (
                     <li
                       className='text-red-500 cursor-pointer flex items-center gap-3'
                       onClick={handleLogout}>
                       <span className='flex items-center justify-center w-7 h-7 rounded-full border border-red-500 text-xs font-black'>
                         N
-                      </span>
+                      </span>{' '}
                       Sign Out
                     </li>
                   )}
@@ -545,17 +746,85 @@ export default function Home() {
         </div>
       )}
 
-      {/* 3. MAIN VIEW SWITCHER */}
+      {isSupportOpen && (
+        <div
+          className='fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/90'
+          onClick={() => setIsSupportOpen(false)}>
+          <div
+            className='bg-[#131921] w-full max-w-sm rounded-2xl p-8 border border-slate-700 shadow-2xl text-center animate-pop-in'
+            onClick={(e) => e.stopPropagation()}>
+            <i className='fas fa-headset text-5xl text-amber-500 mb-4'></i>
+            <h2 className='text-xl font-black uppercase text-white mb-2'>
+              Circuit Cart Support
+            </h2>
+            <p className='text-xs text-slate-400 mb-6 leading-relaxed'>
+              Need help with an order, missing components, or payment
+              verification? We're here for you.
+            </p>
+            <div className='bg-[#020617] p-5 rounded-xl border border-slate-800 mb-6'>
+              <p className='text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2'>
+                Direct Email Line
+              </p>
+              <a
+                href='mailto:circuitcart2025@gmail.com'
+                className='text-amber-500 font-bold text-lg hover:underline break-all'>
+                circuitcart2025@gmail.com
+              </a>
+            </div>
+            <button
+              onClick={() => setIsSupportOpen(false)}
+              className='w-full py-4 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl text-xs uppercase tracking-widest transition-colors shadow-lg'>
+              Close Hub
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className='container mx-auto pt-36 md:pt-44 px-4 pb-24 max-w-6xl'>
         {currentView === 'shop' ? (
           <main className='space-y-4 md:space-y-5 animate-pop-in'>
-            {filteredProducts.map((p) => (
+            <div className='md:hidden flex justify-between items-center mb-5 bg-[#131921] p-3 rounded-xl border border-slate-800 shadow-lg'>
+              <span className='text-slate-400 text-[10px] font-black uppercase tracking-widest flex items-center gap-2'>
+                <i className='fas fa-filter text-amber-500'></i> Catalog
+              </span>
+              <div className='flex items-center bg-[#020617] border border-slate-700 rounded-lg px-3 py-1.5 focus-within:border-amber-500 transition-all shadow-inner'>
+                <select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as any)}
+                  className='bg-transparent text-white font-bold text-[10px] uppercase tracking-widest outline-none cursor-pointer appearance-none pr-3 relative z-10'>
+                  <option value='featured' className='bg-[#131921] text-white'>
+                    Featured
+                  </option>
+                  <option value='price-asc' className='bg-[#131921] text-white'>
+                    Price: Low to High
+                  </option>
+                  <option
+                    value='price-desc'
+                    className='bg-[#131921] text-white'>
+                    Price: High to Low
+                  </option>
+                  <option
+                    value='rating-desc'
+                    className='bg-[#131921] text-white'>
+                    Top Rated
+                  </option>
+                </select>
+                <i className='fas fa-chevron-down text-amber-500 text-[10px] pointer-events-none -ml-1'></i>
+              </div>
+            </div>
+
+            {filteredAndSortedProducts.map((p) => (
               <div
                 key={p.id}
-                className='bg-slate-900/40 border border-slate-800 rounded-xl overflow-hidden flex flex-row shadow-lg min-h-[160px] md:min-h-[200px] will-change-transform'>
+                className={`bg-slate-900/40 border ${p.stock === 0 && p.id !== 32 ? 'border-red-900/50 opacity-60 grayscale-[0.5]' : 'border-slate-800'} rounded-xl overflow-hidden flex flex-row shadow-lg min-h-[160px] md:min-h-[200px] will-change-transform`}>
                 <div
-                  className='w-32 md:w-56 bg-slate-800/30 flex items-center justify-center p-4 cursor-pointer shrink-0'
-                  onClick={() => setSelectedProduct(p)}>
+                  className='w-32 md:w-56 bg-slate-800/30 flex items-center justify-center p-4 cursor-pointer shrink-0 relative'
+                  onClick={() => openProductModal(p)}>
+                  {p.stock === 0 && p.id !== 32 && (
+                    <div className='absolute top-2 left-2 bg-red-600 text-white text-[9px] font-black px-2 py-1 rounded uppercase tracking-widest'>
+                      Out of Stock
+                    </div>
+                  )}
                   <img
                     src={p.image}
                     className='max-h-24 md:max-h-36 object-contain blend-image'
@@ -566,39 +835,59 @@ export default function Home() {
                   <div>
                     <h2
                       className='text-sm md:text-xl font-bold hover:text-amber-500 transition-colors cursor-pointer leading-tight mb-1'
-                      onClick={() => setSelectedProduct(p)}>
+                      onClick={() => openProductModal(p)}>
                       {p.name}
                     </h2>
-                    <div className='flex items-center gap-1 text-amber-400 text-[10px] md:text-xs mb-2'>
-                      <i className='fas fa-star'></i>
-                      <i className='fas fa-star'></i>
-                      <i className='fas fa-star'></i>
-                      <i className='fas fa-star'></i>
-                      <i className='fas fa-star-half-alt'></i>
-                    </div>
+                    {renderStars(p.id)}
                     <p className='text-xs text-slate-400 line-clamp-2 hidden md:block italic'>
                       {p.desc}
                     </p>
                   </div>
                   <div className='mt-2 flex items-end justify-between'>
                     <div>
-                      <div className='flex items-baseline gap-1'>
-                        <span className='text-xs font-bold text-amber-500'>
-                          ₹
-                        </span>
-                        <span className='text-xl md:text-3xl font-black'>
-                          {p.price}
-                        </span>
-                      </div>
-                      <p className='text-[10px] text-slate-500 line-through'>
-                        M.R.P: ₹{Math.round(p.price * 1.5)}
-                      </p>
+                      {/* 🟢 NEW: Custom Project Pricing Display */}
+                      {p.id === 32 ? (
+                        <div className='flex items-baseline gap-1'>
+                          <span className='text-xl md:text-2xl font-black text-amber-500'>
+                            Variable
+                          </span>
+                        </div>
+                      ) : (
+                        <>
+                          <div className='flex items-baseline gap-1'>
+                            <span className='text-xs font-bold text-amber-500'>
+                              ₹
+                            </span>
+                            <span className='text-xl md:text-3xl font-black'>
+                              {p.price}
+                            </span>
+                          </div>
+                          <p className='text-[10px] text-slate-500 line-through'>
+                            M.R.P: ₹{Math.round(p.price * 1.5)}
+                          </p>
+                        </>
+                      )}
                     </div>
-                    <button
-                      onClick={() => addToCart(p)}
-                      className='px-5 md:px-10 py-2 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-lg text-xs md:text-sm uppercase tracking-wider active:scale-95 transition-transform'>
-                      Add
-                    </button>
+                    {/* 🟢 NEW: Custom Project Enquire Button Override */}
+                    {p.id === 32 ? (
+                      <button
+                        onClick={() => openProductModal(p)}
+                        className='px-5 md:px-10 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg text-xs md:text-sm uppercase tracking-wider active:scale-95 transition-transform shadow-lg'>
+                        Enquire
+                      </button>
+                    ) : p.stock === 0 ? (
+                      <button
+                        disabled
+                        className='px-5 md:px-10 py-2 bg-slate-800 border border-slate-700 text-slate-500 font-bold rounded-lg text-xs md:text-sm uppercase tracking-wider cursor-not-allowed'>
+                        Sold Out
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => addToCart(p)}
+                        className='px-5 md:px-10 py-2 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-lg text-xs md:text-sm uppercase tracking-wider active:scale-95 transition-transform'>
+                        Add
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -619,8 +908,8 @@ export default function Home() {
 
             {userOrders.length === 0 ? (
               <div className='py-20 text-center opacity-30 uppercase font-bold tracking-widest flex flex-col items-center'>
-                <i className='fas fa-box-open text-4xl mb-4'></i>
-                No Active Shipment Signals
+                <i className='fas fa-box-open text-4xl mb-4'></i>No Active
+                Shipment Signals
               </div>
             ) : (
               userOrders.map((order) => (
@@ -647,29 +936,46 @@ export default function Home() {
                       </p>
                     </div>
                   </div>
-                  {/* 🛡️ DYNAMIC REJECT-AWARE PROGRESS BAR */}
-<div className='relative h-2.5 bg-slate-800 rounded-full mb-4 overflow-hidden border border-slate-700/50'>
-  <div
-    className={`absolute top-0 left-0 h-full transition-all duration-1000 ${
-      order.status === 'rejected' 
-        ? 'bg-red-600 shadow-[0_0_15px_rgba(220,38,38,0.5)]' 
-        : 'bg-green-500 shadow-[0_0_15px_rgba(34,197,94,0.4)]'
-    }`}
-    style={{ width: getProgressWidth(order) }}></div>
-</div>
-
-<div className='flex justify-between text-[9px] md:text-[10px] font-black uppercase text-slate-500 px-1 tracking-tighter'>
-  {order.status === 'rejected' ? (
-    <span className="text-red-500 w-full text-center animate-pulse">Security Alert: Order Terminated / Payment Verification Failed</span>
-  ) : (
-    <>
-      <span className={order.status === 'pending' ? 'text-green-500' : ''}>Dispatched</span>
-      <span className={order.status === 'confirmed' ? 'text-green-500' : ''}>Verified</span>
-      <span className={order.status === 'shipped' ? 'text-green-500' : ''}>In Transit</span>
-      <span className={order.status === 'delivered' ? 'text-green-500' : ''}>Arrived</span>
-    </>
-  )}
-</div>
+                  <div className='relative h-2.5 bg-slate-800 rounded-full mb-4 overflow-hidden border border-slate-700/50'>
+                    <div
+                      className={`absolute top-0 left-0 h-full transition-all duration-1000 ${order.status === 'rejected' ? 'bg-red-600 shadow-[0_0_15px_rgba(220,38,38,0.5)]' : 'bg-green-500 shadow-[0_0_15px_rgba(34,197,94,0.4)]'}`}
+                      style={{ width: getProgressWidth(order) }}></div>
+                  </div>
+                  <div className='flex justify-between text-[9px] md:text-[10px] font-black uppercase text-slate-500 px-1 tracking-tighter'>
+                    {order.status === 'rejected' ? (
+                      <span className='text-red-500 w-full text-center animate-pulse'>
+                        Security Alert: Order Terminated / Payment Verification
+                        Failed
+                      </span>
+                    ) : (
+                      <>
+                        <span
+                          className={
+                            order.status === 'pending' ? 'text-green-500' : ''
+                          }>
+                          Dispatched
+                        </span>
+                        <span
+                          className={
+                            order.status === 'confirmed' ? 'text-green-500' : ''
+                          }>
+                          Verified
+                        </span>
+                        <span
+                          className={
+                            order.status === 'shipped' ? 'text-green-500' : ''
+                          }>
+                          In Transit
+                        </span>
+                        <span
+                          className={
+                            order.status === 'delivered' ? 'text-green-500' : ''
+                          }>
+                          Arrived
+                        </span>
+                      </>
+                    )}
+                  </div>
                 </div>
               ))
             )}
@@ -677,117 +983,186 @@ export default function Home() {
         )}
       </div>
 
-      {/* 4. MODALS (Checkout, Product Details, Cart) */}
       {isOrderSummaryOpen && (
-        <div className='fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/90'>
-          <div className='bg-[#131921] w-full max-w-lg rounded-2xl p-6 md:p-8 border border-slate-700 shadow-2xl flex flex-col max-h-[90vh] animate-pop-in will-change-transform'>
-            <h2 className='text-2xl font-black uppercase text-white mb-6 border-b border-slate-800 pb-4'>
-              Secure Checkout
-            </h2>
+        <div
+          className='fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/90'
+          onClick={() => setIsOrderSummaryOpen(false)}>
+          <div
+            className='bg-[#131921] w-full max-w-lg rounded-3xl p-6 md:p-10 border border-slate-700 shadow-2xl animate-pop-in custom-scroll max-h-[90vh] overflow-y-auto'
+            onClick={(e) => e.stopPropagation()}>
+            <div className='flex justify-between items-center mb-6 md:mb-8'>
+              <h2 className='text-xl md:text-2xl font-black uppercase tracking-tighter'>
+                Secure Checkout
+              </h2>
+              <button
+                onClick={() => setIsOrderSummaryOpen(false)}
+                className='w-8 h-8 flex items-center justify-center rounded-full bg-slate-800 text-slate-400 hover:text-white transition-colors'>
+                <i className='fas fa-times'></i>
+              </button>
+            </div>
 
-            <div className='flex-1 overflow-y-auto pr-2 custom-scroll space-y-6'>
-              <div className='bg-slate-900/50 rounded-xl border border-slate-800 p-5'>
-                <h3 className='text-xs font-black uppercase text-slate-500 mb-4 tracking-widest'>
-                  Bill Details
-                </h3>
-
-                <div className='space-y-3 mb-4 border-b border-slate-700/50 pb-4'>
-                  {cart.map((item) => (
-                    <div
-                      key={item.product.id}
-                      className='flex justify-between text-xs md:text-sm'>
-                      <span className='text-slate-300 font-medium truncate pr-4'>
-                        {item.product.name}{' '}
-                        <span className='text-amber-500 ml-1'>x{item.qty}</span>
-                      </span>
-                      <span className='text-white font-bold shrink-0'>
-                        ₹{item.product.price * item.qty}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-
-                <div className='space-y-2 text-xs text-slate-400 font-medium'>
-                  <div className='flex justify-between'>
-                    <span>Item Total</span>
-                    <span className='text-white'>₹{subTotal}</span>
+            {checkoutStep === 'cart' ? (
+              <div className='space-y-6 md:space-y-8'>
+                <div className='bg-[#020617] p-5 rounded-2xl border border-slate-800 shadow-inner'>
+                  <div className='flex justify-between text-sm font-bold mb-3'>
+                    <span className='text-slate-400 uppercase tracking-wider'>
+                      Payload ({cartCount} Items)
+                    </span>
+                    <span>₹{subTotal}</span>
                   </div>
-
-                  <div className='flex justify-between'>
-                    <span>Platform Fee</span>
-                    {platformFee === 0 && subTotal > 0 ? (
-                      <span className='text-green-500 font-bold'>
-                        <span className='line-through text-slate-500 font-medium mr-1 text-[10px]'>
-                          ₹10
-                        </span>
-                        Free
-                      </span>
-                    ) : (
-                      <span className='text-white'>₹{platformFee}</span>
-                    )}
+                  <div className='flex justify-between text-sm font-bold mb-3'>
+                    <span className='text-slate-400 uppercase tracking-wider'>
+                      Platform Core Fee
+                    </span>
+                    <span>₹{platformFee}</span>
                   </div>
-
-                  <div className='flex justify-between'>
-                    <span>Delivery Partner Fee</span>
-                    {deliveryFee === 0 && subTotal > 0 ? (
-                      <span className='text-green-500 font-bold'>
-                        <span className='line-through text-slate-500 font-medium mr-1 text-[10px]'>
-                          ₹10
-                        </span>
-                        Free
-                      </span>
-                    ) : (
-                      <span className='text-white'>₹{deliveryFee}</span>
-                    )}
+                  <div className='flex justify-between text-sm font-bold mb-5'>
+                    <span className='text-slate-400 uppercase tracking-wider'>
+                      Logistics Fee
+                    </span>
+                    <span>₹{deliveryFee}</span>
                   </div>
-
-                  {appliedCoupon && (
-                    <div className='flex justify-between text-green-400 font-bold mt-1'>
-                      <span>Promo - ({appliedCoupon})</span>
+                  {discountAmount > 0 && (
+                    <div className='flex justify-between text-sm font-bold mb-5 text-green-500'>
+                      <span className='uppercase tracking-wider'>
+                        Voucher Applied
+                      </span>
                       <span>-₹{discountAmount}</span>
                     </div>
                   )}
+                  <div className='flex justify-between text-xl md:text-3xl font-black text-amber-500 border-t border-slate-800 pt-5'>
+                    <span className='uppercase tracking-wider'>
+                      Final Target
+                    </span>
+                    <span>₹{grandTotal}</span>
+                  </div>
                 </div>
 
-                <div className='border-t border-slate-800 pt-4 mt-3 flex justify-between items-center'>
-                  <span className='text-sm font-black text-amber-500 uppercase'>
-                    To Pay
-                  </span>
-                  <span className='text-3xl font-black text-white'>
-                    ₹{grandTotal}
-                  </span>
-                </div>
-              </div>
-
-              <div className='bg-amber-500/5 border border-amber-500/30 rounded-xl p-6 text-center space-y-5'>
-                <h3 className='text-sm font-black uppercase text-amber-500 tracking-widest'>
-                  Complete Your Payment
-                </h3>
-
-                <div className='bg-white p-3 inline-block rounded-xl'>
-                  <img
-                    src={`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=upi://pay?pa=9547543695@axl&pn=CircuitCart&am=${grandTotal}&cu=INR`}
-                    alt='UPI QR'
-                    className='w-32 h-32'
+                <div className='flex gap-2'>
+                  <input
+                    type='text'
+                    placeholder='PROMO CODE'
+                    className='flex-1 bg-[#020617] border border-slate-700 rounded-xl px-4 font-bold text-sm uppercase outline-none focus:border-amber-500'
+                    value={couponCode}
+                    onChange={(e) => setCouponCode(e.target.value)}
+                    disabled={!!appliedCoupon}
                   />
+                  <button
+                    onClick={handleApplyCoupon}
+                    disabled={!!appliedCoupon}
+                    className={`px-6 py-3 rounded-xl font-bold text-xs uppercase tracking-widest transition-colors ${appliedCoupon ? 'bg-green-500/20 text-green-500' : 'bg-slate-800 text-white hover:bg-slate-700'}`}>
+                    {appliedCoupon ? 'Active' : 'Deploy'}
+                  </button>
                 </div>
 
-                <p className='font-mono text-base font-bold text-white tracking-widest bg-slate-900 py-3 rounded-lg border border-slate-700'>
-                  9547543695@axl
-                </p>
+                <div className='bg-amber-500/10 border border-amber-500/20 p-4 rounded-xl flex items-start gap-3'>
+                  <i className='fas fa-shield-alt text-amber-500 mt-1 text-lg'></i>
+                  <p className='text-[10px] md:text-xs text-slate-300 font-bold uppercase tracking-widest leading-relaxed'>
+                    Encrypted Transaction Protocol Active. Initiating secure
+                    routing sequence.
+                  </p>
+                </div>
 
-                <a
-                  href={`upi://pay?pa=9547543695@axl&pn=CircuitCart&am=${grandTotal}&cu=INR`}
-                  className='md:hidden block w-full py-4 bg-green-600 hover:bg-green-500 text-white font-bold rounded-xl text-xs uppercase shadow-lg transition-transform active:scale-95'>
-                  Pay via UPI App
-                </a>
+                <button
+                  onClick={() => setCheckoutStep('form')}
+                  className='w-full py-4 md:py-5 bg-amber-500 hover:bg-amber-600 text-slate-900 font-black rounded-xl text-sm uppercase tracking-widest transition-transform active:scale-95 shadow-[0_0_20px_rgba(245,158,11,0.2)]'>
+                  Initiate Operator Info
+                </button>
+              </div>
+            ) : (
+              <div className='space-y-6'>
+                <div
+                  className='flex items-center gap-3 mb-6 text-amber-500 cursor-pointer'
+                  onClick={() => setCheckoutStep('cart')}>
+                  <i className='fas fa-arrow-left'></i>
+                  <span className='text-xs font-bold uppercase tracking-widest'>
+                    Back to Bill
+                  </span>
+                </div>
+                <input
+                  type='text'
+                  required
+                  placeholder='Operator Name'
+                  className='w-full p-4 bg-[#020617] border border-slate-700 rounded-xl outline-none focus:border-amber-500 transition-colors text-sm font-bold'
+                  value={formData.name}
+                  onChange={(e) =>
+                    setFormData({ ...formData, name: e.target.value })
+                  }
+                />
+                <input
+                  type='tel'
+                  required
+                  placeholder='Comms Number (10 Digits)'
+                  className='w-full p-4 bg-[#020617] border border-slate-700 rounded-xl outline-none focus:border-amber-500 transition-colors text-sm font-bold'
+                  value={formData.phone}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      phone: e.target.value.replace(/\D/g, ''),
+                    })
+                  }
+                  maxLength={10}
+                />
+                <textarea
+                  required
+                  placeholder='Delivery Coordinates'
+                  className='w-full p-4 bg-[#020617] border border-slate-700 rounded-xl outline-none focus:border-amber-500 transition-colors h-24 resize-none text-sm font-bold'
+                  value={formData.address}
+                  onChange={(e) =>
+                    setFormData({ ...formData, address: e.target.value })
+                  }
+                />
+                <input
+                  type='text'
+                  required
+                  placeholder='Sector Pincode'
+                  className='w-full p-4 bg-[#020617] border border-slate-700 rounded-xl outline-none focus:border-amber-500 transition-colors text-sm font-bold mb-4'
+                  value={formData.pincode}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      pincode: e.target.value.replace(/\D/g, ''),
+                    })
+                  }
+                  maxLength={6}
+                />
+
+                <div className='bg-[#020617] p-6 rounded-2xl border border-slate-700 text-center relative overflow-hidden'>
+                  <div className='absolute top-0 left-0 w-full h-1 bg-amber-500'></div>
+                  <h3 className='text-[10px] font-black uppercase text-slate-400 tracking-[0.2em] mb-4'>
+                    Step 1: Scan & Transfer ₹{grandTotal}
+                  </h3>
+                  <div className='bg-white p-2 rounded-xl inline-block mb-4 shadow-lg'>
+                    <img
+                      src={dynamicQrUrl}
+                      alt='Dynamic UPI QR Code'
+                      className='w-32 h-32 md:w-40 md:h-40'
+                    />
+                  </div>
+                  <div className='bg-[#131921] px-4 py-3 rounded-lg border border-slate-800 flex items-center justify-between mb-4'>
+                    <span className='font-mono font-bold text-sm md:text-base text-amber-500 tracking-wider'>
+                      9547543695@axl
+                    </span>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText('9547543695@axl');
+                        showToast('UPI ID Copied', 'success');
+                      }}
+                      className='text-slate-400 hover:text-white'>
+                      <i className='fas fa-copy'></i>
+                    </button>
+                  </div>
+                  <a
+                    href={upiLink}
+                    className='block w-full bg-green-600 hover:bg-green-500 text-white font-bold py-4 rounded-xl text-xs uppercase tracking-widest mb-6'>
+                    Pay via UPI App
+                  </a>
+                </div>
 
                 <div className='pt-5 border-t border-slate-700/50 text-left'>
                   <label className='block text-[10px] font-black text-amber-500 uppercase tracking-widest mb-3'>
                     Step 2: Upload Payment Evidence
                   </label>
-
-                  {/* MOBILE UPLOAD HUB */}
                   <label className='relative flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-slate-700 rounded-2xl cursor-pointer hover:border-amber-500/50 hover:bg-amber-500/5 transition-all group overflow-hidden'>
                     {receiptFile ? (
                       <div className='flex flex-col items-center animate-pop-in'>
@@ -818,8 +1193,6 @@ export default function Home() {
                       }
                     />
                   </label>
-
-                  {/* UTR VALIDATION BOX */}
                   <div className='mt-6'>
                     <label className='block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2'>
                       Verify 12-Digit UTR Number
@@ -838,293 +1211,151 @@ export default function Home() {
                       }
                     />
                   </div>
-
-                  <p className='text-[9px] text-slate-600 font-bold uppercase tracking-widest mt-4 italic leading-relaxed'>
-                    *Fraudulent uploads result in immediate blacklisting from
-                    the Circuit Cart network.
-                  </p>
                 </div>
-              </div>
-            </div>
 
-            <div className='flex gap-4 pt-6 mt-4 border-t border-slate-800 shrink-0'>
-              <button
-                onClick={() => setIsOrderSummaryOpen(false)}
-                className='flex-1 py-4 font-bold text-slate-400 text-xs uppercase border border-slate-700 rounded-xl hover:bg-slate-800 transition-colors'>
-                Modify
-              </button>
-              <button
-                onClick={confirmInternalOrder}
-                disabled={isSubmitting}
-                className='flex-[2] py-4 bg-amber-500 hover:bg-amber-600 disabled:bg-slate-600 text-slate-900 disabled:text-slate-400 font-bold rounded-xl text-xs uppercase shadow-xl transition-all active:scale-95 flex items-center justify-center gap-2'>
-                {isSubmitting ? (
-                  <>
-                    <i className='fas fa-circle-notch fa-spin'></i>{' '}
-                    Processing...
-                  </>
-                ) : (
-                  `Pay ₹${grandTotal}`
-                )}
-              </button>
-            </div>
+                <label className='flex items-start gap-3 mt-4 mb-2 cursor-pointer group'>
+                  <div className='relative flex items-center justify-center w-5 h-5 mt-0.5 rounded border border-slate-600 group-hover:border-amber-500 transition-colors bg-[#020617] shrink-0'>
+                    <input
+                      type='checkbox'
+                      className='absolute opacity-0 w-full h-full cursor-pointer'
+                      checked={agreedToTerms}
+                      onChange={(e) => setAgreedToTerms(e.target.checked)}
+                    />
+                    {agreedToTerms && (
+                      <i className='fas fa-check text-[10px] text-amber-500'></i>
+                    )}
+                  </div>
+                  <p className='text-[10px] text-slate-400 leading-relaxed font-semibold'>
+                    I verify this payment is accurate and agree to the{' '}
+                    <span className='text-amber-500 hover:underline'>
+                      Terms of Service
+                    </span>{' '}
+                    and{' '}
+                    <span className='text-amber-500 hover:underline'>
+                      Return Policy
+                    </span>
+                    .
+                  </p>
+                </label>
+
+                <button
+                  onClick={confirmInternalOrder}
+                  disabled={isSubmitting}
+                  className='w-full py-4 md:py-5 bg-amber-500 hover:bg-amber-600 disabled:bg-slate-600 text-slate-900 font-black rounded-xl text-sm uppercase tracking-widest shadow-xl flex justify-center items-center gap-3 transition-transform active:scale-95'>
+                  {isSubmitting ? (
+                    <>
+                      <i className='fas fa-circle-notch fa-spin'></i>{' '}
+                      Transmitting
+                    </>
+                  ) : (
+                    'Confirm Transfer & Dispatch'
+                  )}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
 
-      {/* Cart Drawer */}
       {isCartOpen && (
-        <div className='fixed inset-0 z-[110] flex justify-end'>
+        <div className='fixed inset-0 z-[100] flex justify-end'>
           <div
             className='absolute inset-0 bg-black/80'
             onClick={() => setIsCartOpen(false)}></div>
-          <div className='relative w-full max-w-md bg-[#131921] h-full p-6 md:p-8 shadow-2xl flex flex-col border-l border-slate-700 animate-slide-left will-change-transform'>
-            <h2 className='text-xl font-bold uppercase text-white mb-6 flex justify-between'>
-              Your Cart{' '}
-              <button onClick={() => setIsCartOpen(false)}>
-                <i className='fas fa-times text-slate-500'></i>
+          <div className='relative w-full max-w-md bg-[#131921] h-full shadow-2xl flex flex-col border-l border-slate-800 animate-slide-left will-change-transform'>
+            <div className='flex justify-between items-center p-6 border-b border-slate-800 bg-[#232f3e] shrink-0'>
+              <h2 className='text-xl font-black uppercase text-amber-500 tracking-wider'>
+                <i className='fas fa-microchip mr-3'></i>Payload
+              </h2>
+              <button
+                onClick={() => setIsCartOpen(false)}
+                className='w-8 h-8 flex items-center justify-center rounded-full bg-slate-800 text-white hover:bg-red-500 transition-colors'>
+                <i className='fas fa-times'></i>
               </button>
-            </h2>
-            <div className='flex-1 overflow-y-auto space-y-4 pr-2 custom-scroll'>
-              {checkoutStep === 'cart' ? (
-                <>
-                  <div className='space-y-4'>
-                    {cart.map((item) => (
-                      <div
-                        key={item.product.id}
-                        className='flex gap-3 p-3 bg-slate-900 rounded-lg border border-slate-700'>
-                        <img
-                          src={item.product.image}
-                          className='w-16 h-16 object-contain bg-white rounded-md p-2 blend-image'
-                        />
-                        <div className='flex-1 flex flex-col justify-between'>
-                          <h4 className='font-bold text-sm text-white line-clamp-2'>
-                            {item.product.name}
-                          </h4>
-                          <div className='flex items-end justify-between mt-2'>
-                            <p className='text-amber-500 font-black text-base'>
-                              ₹{item.product.price * item.qty}
-                            </p>
-                            <div className='flex items-center gap-3'>
-                              <button
-                                onClick={() => updateQty(item.product.id, -1)}
-                                className='w-8 h-8 flex items-center justify-center bg-slate-800 rounded'>
-                                -
-                              </button>
-                              <span className='text-sm font-bold'>
-                                {item.qty}
-                              </span>
-                              <button
-                                onClick={() => updateQty(item.product.id, 1)}
-                                className='w-8 h-8 flex items-center justify-center bg-slate-800 rounded'>
-                                +
-                              </button>
-                              <button
-                                onClick={() => removeFromCart(item.product.id)}
-                                className='text-red-500 ml-2'>
-                                <i className='fas fa-trash'></i>
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+            </div>
 
-                  {cart.length > 0 && (
-                    <div className='mt-8 border border-dashed border-amber-500/50 bg-amber-500/5 rounded-xl p-4'>
-                      <div className='flex items-center gap-2 text-amber-500 mb-3 text-sm font-bold'>
-                        <i className='fas fa-tags'></i> Apply Coupon
-                      </div>
-
-                      {appliedCoupon ? (
-                        <div className='flex items-center justify-between bg-green-500/10 border border-green-500/20 p-3 rounded-lg'>
-                          <div>
-                            <p className='text-green-400 font-bold text-sm'>
-                              '{appliedCoupon}' applied
-                            </p>
-                            <p className='text-[10px] text-green-500/80'>
-                              You saved ₹{discountAmount} on this order!
-                            </p>
-                          </div>
-                          <button
-                            onClick={() => {
-                              setAppliedCoupon(null);
-                              setCouponCode('');
-                            }}
-                            className='text-red-400 text-xs font-bold uppercase tracking-widest hover:text-red-300'>
-                            Remove
-                          </button>
-                        </div>
-                      ) : (
-                        <div>
-                          <p className='text-[10px] text-slate-400 mb-2 leading-tight'>
-                            Use <b className='text-white'>CIRCUIT10</b> for 10%
-                            OFF on orders above ₹100!
-                          </p>
-                          <div className='flex gap-2'>
-                            <input
-                              type='text'
-                              placeholder='e.g. CIRCUIT10'
-                              className='flex-1 bg-[#020617] border border-slate-700 rounded-lg px-3 py-2 text-sm font-bold uppercase outline-none focus:border-amber-500 text-white'
-                              value={couponCode}
-                              onChange={(e) =>
-                                setCouponCode(e.target.value.toUpperCase())
-                              }
-                            />
-                            <button
-                              onClick={handleApplyCoupon}
-                              className='px-4 bg-slate-800 hover:bg-slate-700 font-bold rounded-lg text-xs uppercase transition-colors'>
-                              Apply
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {cart.length > 0 && (
-                    <div className='mt-6 space-y-2 text-xs text-slate-400 border-t border-slate-800 pt-6'>
-                      <div className='flex justify-between'>
-                        <span>Item Total</span>
-                        <span className='text-white'>₹{subTotal}</span>
-                      </div>
-                      <div className='flex justify-between'>
-                        <span>
-                          Platform Fee{' '}
-                          {subTotal < MIN_ORDER_VALUE && (
-                            <span className='text-[10px] ml-1'>
-                              (Free over ₹200)
-                            </span>
-                          )}
-                        </span>
-                        {platformFee === 0 ? (
-                          <span className='text-green-500 font-bold'>Free</span>
-                        ) : (
-                          <span className='text-white'>₹{platformFee}</span>
-                        )}
-                      </div>
-                      <div className='flex justify-between'>
-                        <span>
-                          Delivery Fee{' '}
-                          {subTotal < MIN_ORDER_VALUE && (
-                            <span className='text-[10px] ml-1'>
-                              (Free over ₹200)
-                            </span>
-                          )}
-                        </span>
-                        {deliveryFee === 0 ? (
-                          <span className='text-green-500 font-bold'>Free</span>
-                        ) : (
-                          <span className='text-white'>₹{deliveryFee}</span>
-                        )}
-                      </div>
-                      {appliedCoupon && (
-                        <div className='flex justify-between text-green-400 font-bold'>
-                          <span>Discount</span>
-                          <span>-₹{discountAmount}</span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className='space-y-5'>
-                  <h3 className='text-sm font-bold uppercase text-amber-500 mb-4 border-b border-slate-700 pb-2'>
-                    Delivery Information
-                  </h3>
-
-                  <div>
-                    <label className='block text-xs font-bold text-slate-400 uppercase mb-1'>
-                      Target (Name)
-                    </label>
-                    <input
-                      type='text'
-                      placeholder='Full Name'
-                      className='w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors'
-                      value={formData.name}
-                      onChange={(e) =>
-                        setFormData({ ...formData, name: e.target.value })
-                      }
-                    />
-                  </div>
-                  <div>
-                    <label className='block text-xs font-bold text-slate-400 uppercase mb-1'>
-                      Signal (Phone)
-                    </label>
-                    <input
-                      type='text'
-                      maxLength={10}
-                      placeholder='10-Digit Mobile'
-                      className='w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors'
-                      value={formData.phone}
-                      onChange={(e) =>
-                        setFormData({
-                          ...formData,
-                          phone: e.target.value.replace(/[^0-9]/g, ''),
-                        })
-                      }
-                    />
-                  </div>
-                  <div>
-                    <label className='block text-xs font-bold text-slate-400 uppercase mb-1'>
-                      Coordinate (Address)
-                    </label>
-                    <textarea
-                      placeholder='Complete Delivery Address'
-                      className='w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors h-24'
-                      value={formData.address}
-                      onChange={(e) =>
-                        setFormData({ ...formData, address: e.target.value })
-                      }></textarea>
-                  </div>
-                  <div>
-                    <label className='block text-xs font-bold text-slate-400 uppercase mb-1'>
-                      Pincode
-                    </label>
-                    <input
-                      type='text'
-                      maxLength={6}
-                      placeholder='6-Digit PIN'
-                      className='w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm outline-none focus:border-amber-500 transition-colors'
-                      value={formData.pincode}
-                      onChange={(e) =>
-                        setFormData({
-                          ...formData,
-                          pincode: e.target.value.replace(/[^0-9]/g, ''),
-                        })
-                      }
-                    />
-                  </div>
+            <div className='flex-1 overflow-y-auto p-6 space-y-6 custom-scroll'>
+              {cart.length === 0 ? (
+                <div className='h-full flex flex-col items-center justify-center text-slate-500 opacity-50'>
+                  <i className='fas fa-box-open text-6xl mb-4'></i>
+                  <p className='text-xs font-bold uppercase tracking-widest'>
+                    Payload Empty
+                  </p>
                 </div>
+              ) : (
+                cart.map((item) => (
+                  <div
+                    key={item.product.id}
+                    className='flex gap-5 bg-[#020617] p-4 rounded-xl border border-slate-800 relative'>
+                    <button
+                      onClick={() => removeFromCart(item.product.id)}
+                      className='absolute -top-2 -right-2 w-6 h-6 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center text-[10px] transition-colors'>
+                      <i className='fas fa-times'></i>
+                    </button>
+                    <div className='w-20 h-20 bg-slate-800/50 rounded-lg flex items-center justify-center p-2 shrink-0'>
+                      <img
+                        src={item.product.image}
+                        className='max-h-full object-contain blend-image'
+                      />
+                    </div>
+                    <div className='flex-1 flex flex-col justify-between'>
+                      <div>
+                        <h3 className='font-bold text-sm leading-tight text-white line-clamp-2 mb-1'>
+                          {item.product.name}
+                        </h3>
+                        <p className='text-amber-500 font-black'>
+                          ₹{item.product.price}
+                        </p>
+                      </div>
+                      <div className='flex items-center gap-4 mt-2'>
+                        <button
+                          onClick={() => updateQty(item.product.id, -1)}
+                          className='w-7 h-7 rounded-md bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-xs'>
+                          <i className='fas fa-minus'></i>
+                        </button>
+                        <span className='font-bold text-sm w-4 text-center'>
+                          {item.qty}
+                        </span>
+                        <button
+                          onClick={() => updateQty(item.product.id, 1)}
+                          className='w-7 h-7 rounded-md bg-slate-800 hover:bg-slate-700 flex items-center justify-center text-xs'>
+                          <i className='fas fa-plus'></i>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))
               )}
             </div>
 
             {cart.length > 0 && (
-              <div className='mt-4 pt-5 border-t border-slate-700'>
-                <div className='flex justify-between items-end mb-4'>
-                  <span className='text-slate-400 text-sm uppercase font-bold'>
-                    To Pay
+              <div className='p-6 border-t border-slate-800 bg-[#020617] shrink-0'>
+                <div className='flex justify-between items-end mb-6'>
+                  <span className='text-xs font-bold uppercase text-slate-400 tracking-widest'>
+                    Subtotal
                   </span>
-                  <span className='text-2xl font-black text-white'>
-                    ₹{grandTotal}
+                  <span className='text-3xl font-black text-amber-500'>
+                    ₹{subTotal}
                   </span>
                 </div>
-                <button
-                  onClick={() =>
-                    checkoutStep === 'cart'
-                      ? setCheckoutStep('form')
-                      : setIsOrderSummaryOpen(true)
-                  }
-                  className='w-full py-4 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-lg text-sm md:text-xs uppercase tracking-wider transition-transform active:scale-95 shadow-xl'>
-                  {checkoutStep === 'cart'
-                    ? 'Proceed to Checkout'
-                    : 'Review Final Order'}
-                </button>
-                {checkoutStep === 'form' && (
+                {subTotal < MIN_ORDER_VALUE ? (
+                  <div className='bg-red-500/10 border border-red-500/20 rounded-xl p-4 text-center'>
+                    <i className='fas fa-exclamation-triangle text-red-500 text-2xl mb-2'></i>
+                    <p className='text-[10px] font-bold uppercase text-red-400 tracking-wider'>
+                      Minimum payload requirement: ₹{MIN_ORDER_VALUE}
+                    </p>
+                    <p className='text-xs font-black text-white mt-1'>
+                      Add ₹{MIN_ORDER_VALUE - subTotal} more to proceed
+                    </p>
+                  </div>
+                ) : (
                   <button
-                    onClick={() => setCheckoutStep('cart')}
-                    className='w-full mt-3 py-3 text-slate-400 text-xs font-bold uppercase hover:text-white transition-colors'>
-                    ← Back to Cart
+                    onClick={() => {
+                      setIsCartOpen(false);
+                      setIsOrderSummaryOpen(true);
+                    }}
+                    className='w-full py-5 bg-green-500 hover:bg-green-600 text-slate-900 font-black rounded-xl text-sm uppercase tracking-widest transition-transform active:scale-95 shadow-[0_0_20px_rgba(34,197,94,0.3)]'>
+                    Authorize Checkout
                   </button>
                 )}
               </div>
@@ -1133,43 +1364,228 @@ export default function Home() {
         </div>
       )}
 
-      {selectedProduct && (
-        <div className='fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/80'>
-          <div className='bg-[#131921] rounded-xl w-full max-w-4xl overflow-hidden shadow-2xl flex flex-col md:flex-row relative border border-slate-700 animate-pop-in will-change-transform'>
+      {isReviewModalOpen && selectedProduct && (
+        <div
+          className='fixed inset-0 z-[150] flex items-center justify-center p-4 bg-black/90'
+          onClick={() => setIsReviewModalOpen(false)}>
+          <div
+            className='bg-[#131921] w-full max-w-md rounded-2xl p-6 md:p-8 border border-slate-700 shadow-2xl animate-pop-in'
+            onClick={(e) => e.stopPropagation()}>
+            <h2 className='text-xl font-black uppercase text-white mb-6 border-b border-slate-800 pb-4'>
+              Rate Your Experience
+            </h2>
+            <div className='flex gap-2 mb-6 justify-center'>
+              {[1, 2, 3, 4, 5].map((star) => (
+                <i
+                  key={star}
+                  className={`fas fa-star text-3xl cursor-pointer transition-colors ${reviewForm.rating >= star ? 'text-amber-500 drop-shadow-[0_0_8px_rgba(245,158,11,0.5)]' : 'text-slate-700'}`}
+                  onClick={() =>
+                    setReviewForm({ ...reviewForm, rating: star })
+                  }></i>
+              ))}
+            </div>
+            <textarea
+              placeholder='How did this component perform in your project?'
+              className='w-full bg-[#020617] border border-slate-700 rounded-xl p-4 text-sm text-white outline-none focus:border-amber-500 h-28 mb-4 resize-none'
+              value={reviewForm.comment}
+              onChange={(e) =>
+                setReviewForm({ ...reviewForm, comment: e.target.value })
+              }
+            />
+            <label className='flex items-center justify-center gap-3 w-full border-2 border-dashed border-slate-700 hover:border-amber-500/50 hover:bg-amber-500/5 p-4 rounded-xl cursor-pointer transition-all mb-6'>
+              <i
+                className={`fas ${reviewFile ? 'fa-check-circle text-green-500' : 'fa-camera text-slate-500'} text-xl`}></i>
+              <span
+                className={`text-xs font-bold uppercase ${reviewFile ? 'text-white' : 'text-slate-400'}`}>
+                {reviewFile
+                  ? 'Photo Attached'
+                  : 'Upload Project Photo (Optional)'}
+              </span>
+              <input
+                type='file'
+                accept='image/*'
+                className='hidden'
+                onChange={(e) =>
+                  setReviewFile(e.target.files ? e.target.files[0] : null)
+                }
+              />
+            </label>
+            <div className='flex gap-3'>
+              <button
+                onClick={() => setIsReviewModalOpen(false)}
+                className='flex-1 py-3 text-slate-400 font-bold uppercase text-xs border border-slate-700 rounded-xl hover:bg-slate-800'>
+                Cancel
+              </button>
+              <button
+                onClick={handleSubmitReview}
+                disabled={isSubmittingReview}
+                className='flex-[2] py-3 bg-amber-500 hover:bg-amber-600 disabled:bg-slate-600 text-slate-900 font-bold uppercase text-xs rounded-xl shadow-lg flex items-center justify-center gap-2'>
+                {isSubmittingReview ? (
+                  <>
+                    <i className='fas fa-spinner fa-spin'></i> Submitting
+                  </>
+                ) : (
+                  'Publish Review'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedProduct && !isReviewModalOpen && (
+        <div
+          className='fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/80'
+          onClick={() => setSelectedProduct(null)}>
+          <div
+            className='bg-[#131921] rounded-xl w-full max-w-4xl overflow-hidden shadow-2xl flex flex-col md:flex-row relative border border-slate-700 animate-pop-in will-change-transform'
+            onClick={(e) => e.stopPropagation()}>
             <button
               onClick={() => setSelectedProduct(null)}
               className='absolute top-4 right-4 z-10 w-10 h-10 bg-slate-800 hover:bg-red-500 rounded-full flex items-center justify-center text-white transition-colors'>
               <i className='fas fa-times'></i>
             </button>
-            <div className='md:w-1/2 bg-slate-900 p-8 flex items-center justify-center border-b md:border-b-0 md:border-r border-slate-700'>
+
+            <div className='md:w-1/2 bg-[#020617] p-8 flex items-center justify-center border-b md:border-b-0 md:border-r border-slate-700 relative'>
+              {/* 🟢 NEW: Out of Stock Badge skips Custom Project */}
+              {selectedProduct.stock === 0 && selectedProduct.id !== 32 && (
+                <div className='absolute top-6 left-6 bg-red-600 text-white text-xs font-black px-3 py-1.5 rounded uppercase tracking-widest shadow-xl'>
+                  Out of Stock
+                </div>
+              )}
               <img
                 src={selectedProduct.image}
                 className='max-h-52 md:max-h-72 object-contain blend-image'
               />
             </div>
-            <div className='md:w-1/2 p-8 md:p-10 flex flex-col'>
-              <span className='text-xs font-bold uppercase text-amber-500 tracking-widest mb-2'>
-                {selectedProduct.category}
-              </span>
-              <h2 className='text-2xl md:text-2xl font-bold text-white leading-tight mb-3'>
-                {selectedProduct.name}
-              </h2>
-              <p className='text-amber-500 text-3xl md:text-2xl font-black mb-5'>
-                ₹{selectedProduct.price}
-              </p>
-              <div className='flex-1 bg-slate-900 p-5 rounded-lg border border-slate-700 mb-6 overflow-y-auto max-h-48 custom-scroll'>
-                <p className='text-sm text-slate-300 leading-relaxed whitespace-pre-line'>
-                  {selectedProduct.details || selectedProduct.desc}
-                </p>
+
+            <div className='md:w-1/2 p-6 md:p-8 flex flex-col max-h-[80vh]'>
+              <div className='shrink-0 mb-4 border-b border-slate-800 pb-4'>
+                <span className='text-[10px] font-black uppercase text-amber-500 tracking-widest mb-1 block'>
+                  {selectedProduct.category}
+                </span>
+                <h2 className='text-xl md:text-2xl font-black text-white leading-tight mb-2'>
+                  {selectedProduct.name}
+                </h2>
+                {renderStars(selectedProduct.id)}
+
+                {/* 🟢 NEW: Price Label Override */}
+                {selectedProduct.id === 32 ? (
+                  <p className='text-amber-500 text-2xl font-black mt-2'>
+                    Variable
+                  </p>
+                ) : (
+                  <p className='text-amber-500 text-2xl font-black mt-2'>
+                    ₹{selectedProduct.price}
+                  </p>
+                )}
               </div>
-              <button
-                onClick={() => {
-                  addToCart(selectedProduct);
-                  setSelectedProduct(null);
-                }}
-                className='w-full py-4 bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold rounded-lg text-base md:text-sm uppercase transition-transform active:scale-95 shadow-lg'>
-                Add to Cart
-              </button>
+
+              <div className='flex-1 overflow-y-auto custom-scroll pr-2 mb-6 space-y-6'>
+                <div className='bg-slate-900/50 p-4 rounded-xl border border-slate-800'>
+                  <p className='text-xs text-slate-300 leading-relaxed whitespace-pre-line font-medium'>
+                    {selectedProduct.details || selectedProduct.desc}
+                  </p>
+                </div>
+
+                <div className='bg-slate-900/30 p-4 rounded-xl border border-slate-800/50'>
+                  <div className='flex justify-between items-end mb-4 border-b border-slate-800/50 pb-3'>
+                    <h3 className='text-xs font-black uppercase text-amber-500 tracking-widest'>
+                      <i className='fas fa-star mr-2'></i>Field Tests & Reviews
+                    </h3>
+                    {checkCanReview(selectedProduct.id) && (
+                      <button
+                        onClick={() => setIsReviewModalOpen(true)}
+                        className='text-[10px] font-bold bg-amber-500/10 hover:bg-amber-500/20 text-amber-500 border border-amber-500/20 px-3 py-1.5 rounded uppercase tracking-wider transition-colors'>
+                        Write Review
+                      </button>
+                    )}
+                  </div>
+
+                  {reviews.length === 0 ? (
+                    <div className='text-center py-6 text-slate-500 border border-dashed border-slate-700 rounded-lg'>
+                      <i className='fas fa-comment-slash text-2xl mb-2'></i>
+                      <p className='text-[10px] font-bold uppercase tracking-widest'>
+                        No field data recorded yet.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className='space-y-3'>
+                      {reviews.map((r) => (
+                        <div
+                          key={r.id}
+                          className='bg-[#020617] p-4 rounded-xl border border-slate-800'>
+                          <div className='flex justify-between items-start mb-2'>
+                            <span className='text-xs font-black text-white uppercase'>
+                              {r.user_name}
+                            </span>
+                            <div className='text-amber-500 text-[9px] flex gap-0.5'>
+                              {[...Array(5)].map((_, i) => (
+                                <i
+                                  key={i}
+                                  className={`fas fa-star ${i < r.rating ? '' : 'text-slate-700'}`}></i>
+                              ))}
+                            </div>
+                          </div>
+                          {r.comment && (
+                            <p className='text-xs text-slate-400 italic leading-relaxed mb-3'>
+                              "{r.comment}"
+                            </p>
+                          )}
+                          {r.image_url && (
+                            <img
+                              src={r.image_url}
+                              alt='User project'
+                              className='w-16 h-16 object-cover rounded-lg border border-slate-700 cursor-pointer hover:border-amber-500 transition-colors'
+                              onClick={() => window.open(r.image_url, '_blank')}
+                            />
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* 🟢 NEW: Custom Project Override on Modal Buttons */}
+              <div className='mt-auto pt-4 shrink-0 border-t border-slate-800'>
+                {selectedProduct.id === 32 ? (
+                  <div className='space-y-3 mt-4'>
+                    <p className='text-[10px] font-black text-blue-500 uppercase tracking-[0.2em] text-center mb-2'>
+                      Special Request Protocol
+                    </p>
+                    <a
+                      href={`https://wa.me/919547543695?text=${encodeURIComponent(`Hello Circuit Cart! I am interested in a Custom Project. Here is my idea: `)}`}
+                      target='_blank'
+                      rel='noopener noreferrer'
+                      className='w-full py-4 bg-green-600 hover:bg-green-500 text-white font-black rounded-xl text-sm uppercase tracking-widest transition-transform active:scale-95 shadow-xl flex items-center justify-center gap-3'>
+                      <i className='fab fa-whatsapp text-lg'></i> Discuss on
+                      WhatsApp
+                    </a>
+                    <a
+                      href='mailto:circuitcart2025@gmail.com?subject=Custom%20Project%20Inquiry'
+                      onClick={() => setSelectedProduct(null)}
+                      className='w-full py-3 bg-transparent border border-slate-700 text-slate-400 font-bold rounded-xl text-xs uppercase tracking-widest hover:bg-slate-800 transition-colors block text-center'>
+                      Contact Support via Email
+                    </a>
+                  </div>
+                ) : selectedProduct.stock === 0 ? (
+                  <button
+                    disabled
+                    className='w-full py-4 bg-slate-800 text-slate-500 font-black rounded-xl text-sm uppercase tracking-widest cursor-not-allowed border border-slate-700 mt-4'>
+                    Inventory Depleted
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => {
+                      addToCart(selectedProduct);
+                      setSelectedProduct(null);
+                    }}
+                    className='w-full py-4 bg-amber-500 hover:bg-amber-600 text-slate-900 font-black rounded-xl text-sm uppercase tracking-widest transition-transform active:scale-95 shadow-xl shrink-0 mt-4'>
+                    Add to Cart
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -1183,28 +1599,51 @@ export default function Home() {
       )}
 
       <style jsx global>{`
+        .blend-image {
+          mix-blend-mode: screen;
+          filter: drop-shadow(0 0 10px rgba(255, 255, 255, 0.1));
+        }
+        .custom-scroll::-webkit-scrollbar {
+          width: 4px;
+        }
+        .custom-scroll::-webkit-scrollbar-thumb {
+          background: #334155;
+          border-radius: 10px;
+        }
         .animate-pop-in {
           animation: popIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
         @keyframes popIn {
           0% {
             opacity: 0;
-            transform: scale(0.97) translateY(10px);
+            transform: scale(0.95);
           }
           100% {
             opacity: 1;
-            transform: scale(1) translateY(0);
+            transform: scale(1);
           }
         }
-        .no-scrollbar::-webkit-scrollbar {
-          display: none;
+        .animate-slide-left {
+          animation: slideLeft 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
-        .custom-scroll::-webkit-scrollbar {
-          width: 5px;
+        @keyframes slideLeft {
+          0% {
+            transform: translateX(100%);
+          }
+          100% {
+            transform: translateX(0);
+          }
         }
-        .custom-scroll::-webkit-scrollbar-thumb {
-          background: #334155;
-          border-radius: 10px;
+        .animate-slide-right {
+          animation: slideRight 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        @keyframes slideRight {
+          0% {
+            transform: translateX(-100%);
+          }
+          100% {
+            transform: translateX(0);
+          }
         }
       `}</style>
     </div>
