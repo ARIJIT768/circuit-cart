@@ -203,6 +203,14 @@ export default function Home() {
       .upsert({ user_id: user.id, cart_data: newCart, updated_at: new Date() });
   };
 
+  const getProgressWidth = (order: Order) => {
+    if (order.status === 'rejected') return '100%'; 
+    if (order.status === 'delivered') return '100%';
+    if (order.status === 'shipped') return '75%';
+    if (order.status === 'confirmed') return '45%';
+    return '15%';
+  };
+
   const addToCart = (product: Product) => {
     const existing = cart.find((item) => item.product.id === product.id);
     const newCart = existing
@@ -326,13 +334,6 @@ export default function Home() {
   const showToast = (msg: string, type: 'success' | 'error') => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3000);
-  };
-
-  const getProgressWidth = (order: Order) => {
-    if (order.status === 'delivered') return '100%';
-    if (order.status === 'shipped') return '75%';
-    if (order.status === 'confirmed') return '45%';
-    return '15%';
   };
 
   const filteredProducts = products.filter(
@@ -646,38 +647,29 @@ export default function Home() {
                       </p>
                     </div>
                   </div>
+                  {/* 🛡️ DYNAMIC REJECT-AWARE PROGRESS BAR */}
+<div className='relative h-2.5 bg-slate-800 rounded-full mb-4 overflow-hidden border border-slate-700/50'>
+  <div
+    className={`absolute top-0 left-0 h-full transition-all duration-1000 ${
+      order.status === 'rejected' 
+        ? 'bg-red-600 shadow-[0_0_15px_rgba(220,38,38,0.5)]' 
+        : 'bg-green-500 shadow-[0_0_15px_rgba(34,197,94,0.4)]'
+    }`}
+    style={{ width: getProgressWidth(order) }}></div>
+</div>
 
-                  <div className='relative h-2.5 bg-slate-800 rounded-full mb-4 overflow-hidden border border-slate-700/50'>
-                    <div
-                      className='absolute top-0 left-0 h-full bg-green-500 shadow-[0_0_15px_rgba(34,197,94,0.4)] transition-all duration-1000'
-                      style={{ width: getProgressWidth(order) }}></div>
-                  </div>
-                  <div className='flex justify-between text-[9px] md:text-[10px] font-black uppercase text-slate-500 px-1 tracking-tighter'>
-                    <span
-                      className={
-                        order.status === 'pending' ? 'text-green-500' : ''
-                      }>
-                      Dispatched
-                    </span>
-                    <span
-                      className={
-                        order.status === 'confirmed' ? 'text-green-500' : ''
-                      }>
-                      Verified
-                    </span>
-                    <span
-                      className={
-                        order.status === 'shipped' ? 'text-green-500' : ''
-                      }>
-                      In Transit
-                    </span>
-                    <span
-                      className={
-                        order.status === 'delivered' ? 'text-green-500' : ''
-                      }>
-                      Arrived
-                    </span>
-                  </div>
+<div className='flex justify-between text-[9px] md:text-[10px] font-black uppercase text-slate-500 px-1 tracking-tighter'>
+  {order.status === 'rejected' ? (
+    <span className="text-red-500 w-full text-center animate-pulse">Security Alert: Order Terminated / Payment Verification Failed</span>
+  ) : (
+    <>
+      <span className={order.status === 'pending' ? 'text-green-500' : ''}>Dispatched</span>
+      <span className={order.status === 'confirmed' ? 'text-green-500' : ''}>Verified</span>
+      <span className={order.status === 'shipped' ? 'text-green-500' : ''}>In Transit</span>
+      <span className={order.status === 'delivered' ? 'text-green-500' : ''}>Arrived</span>
+    </>
+  )}
+</div>
                 </div>
               ))
             )}
