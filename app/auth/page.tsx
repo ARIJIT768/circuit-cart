@@ -20,6 +20,21 @@ export default function AuthPage() {
   
   const router = useRouter();
 
+  // 📡 NEW: The "Magic Link Catcher"
+  // If a user clicks an email link, this detects the background login and redirects them instantly.
+  useEffect(() => {
+    const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_IN' && session) {
+        setSuccessMsg('Authentication detected! Redirecting...');
+        setTimeout(() => { window.location.href = '/'; }, 600);
+      }
+    });
+
+    return () => {
+      authListener.subscription.unsubscribe();
+    };
+  }, []);
+
   // ⏱️ Timer countdown logic
   useEffect(() => {
     let interval: NodeJS.Timeout;
@@ -28,13 +43,6 @@ export default function AuthPage() {
     }
     return () => clearInterval(interval);
   }, [resendTimer]);
-
-  // ⚡ NEW: Auto-Verify when 6 digits are typed
-  useEffect(() => {
-    if (otp.length === 6 && !loading) {
-      handleVerifyOtp();
-    }
-  }, [otp]);
 
   // 🛡️ FRONTEND VALIDATION
   const validateEmailAndName = () => {
@@ -55,7 +63,8 @@ export default function AuthPage() {
   // STEP 1: REQUEST THE 6-DIGIT CODE
   const handleSendOtp = async (e?: React.FormEvent | React.MouseEvent) => {
     if (e) e.preventDefault();
-    if (resendTimer > 0) return;
+    // 🛡️ STRICT LOCK: Prevent double clicks
+    if (loading || resendTimer > 0) return;
 
     setErrorMsg('');
     setSuccessMsg('');
@@ -92,7 +101,7 @@ export default function AuthPage() {
       setIsOtpSent(true);
       setResendTimer(60); 
       setSuccessMsg('Verification code sent to your email.');
-      setOtp(''); // Clear OTP field if they are resending
+      setOtp(''); 
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to send code. Please check your network.");
     } finally {
@@ -103,6 +112,9 @@ export default function AuthPage() {
   // STEP 2: VERIFY THE 6-DIGIT CODE
   const handleVerifyOtp = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    // 🛡️ STRICT LOCK: Prevent race condition freezes
+    if (loading) return;
+
     setErrorMsg('');
     setSuccessMsg('');
 
@@ -123,11 +135,12 @@ export default function AuthPage() {
       if (error) throw error;
 
       setSuccessMsg('Login successful! Redirecting to shop...');
+      // The auth listener above will likely catch the success first and redirect!
       setTimeout(() => { window.location.href = '/'; }, 1000);
 
     } catch (err: any) {
       setErrorMsg("Invalid or expired code. Please try again.");
-      setOtp(''); // Auto-clear the wrong code so they can quickly retype
+      setOtp(''); 
     } finally {
       setLoading(false);
     }
