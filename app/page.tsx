@@ -1483,9 +1483,13 @@ export default function Home() {
 
               <div className='flex-1 overflow-y-auto custom-scroll pr-2 mb-6 space-y-6'>
                 <div className='bg-slate-900/50 p-4 rounded-xl border border-slate-800'>
-                  <p className='text-xs text-slate-300 leading-relaxed whitespace-pre-line font-medium'>
-                    {selectedProduct.details || selectedProduct.desc}
-                  </p>
+                <div className='text-xs text-slate-300 leading-relaxed font-medium space-y-1'>
+  {String(selectedProduct.details || selectedProduct.desc)
+    .split(/\\n|\n/)
+    .map((line, index) => (
+      <p key={index}>{line}</p>
+  ))}
+</div>
                 </div>
 
                 <div className='bg-slate-900/30 p-4 rounded-xl border border-slate-800/50'>
