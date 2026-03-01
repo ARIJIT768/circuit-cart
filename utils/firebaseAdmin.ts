@@ -1,11 +1,10 @@
 import * as admin from 'firebase-admin';
 
-// 1. Prepare the key first to ensure it's valid PEM format
+// 1. Prepare the key: Handle both actual newlines and literal '\n' strings
 const rawKey = process.env.FIREBASE_PRIVATE_KEY || '';
 const formattedKey = rawKey.replace(/\\n/g, '\n');
 
-// 2. Initialize only if no apps exist
-if (!admin.apps.length) {
+if (!admin.apps.length && formattedKey) {
   try {
     admin.initializeApp({
       credential: admin.credential.cert({
@@ -20,6 +19,7 @@ if (!admin.apps.length) {
   }
 }
 
-// 3. Export the services safely
-export const adminDb = admin.firestore();
-export const adminAuth = admin.auth();
+// 2. Export the services safely
+// We use a getter or check length to ensure they are only accessed if init worked
+export const adminDb = admin.apps.length ? admin.firestore() : null!;
+export const adminAuth = admin.apps.length ? admin.auth() : null!;
