@@ -1,14 +1,11 @@
 import * as admin from 'firebase-admin';
 
-if (!admin.apps.length) {
-  // Use a fallback to empty string to prevent the .replace from crashing if undefined
-  const rawKey = process.env.FIREBASE_PRIVATE_KEY || '';
-  
-  // 🔥 This double-checks the BEGIN/END tags and forces real newlines
-  const formattedKey = rawKey.includes('---') 
-    ? rawKey.replace(/\\n/g, '\n') 
-    : undefined;
+// 1. Prepare the key first to ensure it's valid PEM format
+const rawKey = process.env.FIREBASE_PRIVATE_KEY || '';
+const formattedKey = rawKey.replace(/\\n/g, '\n');
 
+// 2. Initialize only if no apps exist
+if (!admin.apps.length) {
   try {
     admin.initializeApp({
       credential: admin.credential.cert({
@@ -17,11 +14,12 @@ if (!admin.apps.length) {
         privateKey: formattedKey,
       }),
     });
-    console.log("✅ Firebase Admin Initialized Successfully");
+    console.log("✅ Firebase Admin Initialized");
   } catch (error) {
     console.error("❌ Firebase Admin Init Error:", error);
   }
 }
 
+// 3. Export the services safely
 export const adminDb = admin.firestore();
 export const adminAuth = admin.auth();
