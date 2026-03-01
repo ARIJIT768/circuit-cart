@@ -1,7 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { NextResponse } from 'next/server';
-import { adminDb } from '@/utils/firebaseAdmin';
+import { getAdminDb } from '@/utils/firebaseAdmin'; // 🔥 Using the safe getter
 
 export async function POST(req: Request) {
   try {
@@ -12,18 +12,22 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Data payload incomplete.' }, { status: 400 });
     }
 
-    // Pull all "delivered" orders for this specific user directly from the secure database
+    // 🔥 Safely fetch the DB instance only when the request is made
+    const adminDb = getAdminDb();
+
+    // Pull all "delivered" orders for this specific user
     const ordersSnapshot = await adminDb
       .collection('orders')
       .where('user_id', '==', userId)
       .where('status', '==', 'delivered')
       .get();
 
-    // Check if the product they are reviewing is inside any of those delivered orders
+    // Check if the product is inside any of those delivered orders
     let hasPurchased = false;
     ordersSnapshot.forEach((doc) => {
       const order = doc.data();
       const items = order.items || [];
+      // Use standard JS 'some' to check the nested product ID
       if (items.some((item: any) => item.product.id === productId)) {
         hasPurchased = true;
       }
@@ -37,7 +41,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // If they did buy it, save the review!
+    // If they did buy it, save the review
     const newReview = {
       product_id: productId,
       user_id: userId,
