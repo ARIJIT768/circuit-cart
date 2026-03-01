@@ -1,41 +1,55 @@
 import * as admin from 'firebase-admin';
 
 const initializeAdmin = () => {
+  // Prevent re-initialization
   if (admin.apps.length > 0) return admin.app();
 
   const rawKey = process.env.FIREBASE_PRIVATE_KEY || '';
-  // Force clean the key only if it exists
-  const formattedKey = rawKey.replace(/\\n/g, '\n');
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
 
-  if (!formattedKey || !process.env.FIREBASE_PROJECT_ID) {
-    // During build, environment variables might be missing. 
-    // We return null instead of throwing an error to let the build finish.
+  // 1. Basic Existence Check
+  if (!rawKey || !projectId || !clientEmail) {
+    console.error("❌ Firebase Init Failed: Missing Environment Variables");
     return null;
   }
 
+  // 2. Formatting the key
+  const formattedKey = rawKey.replace(/\\n/g, '\n');
+
+  // 3. Diagnostic Header Check (Crucial for PEM errors)
+  if (!formattedKey.includes("-----BEGIN PRIVATE KEY-----")) {
+    console.error("❌ PEM Error: The Private Key is missing the BEGIN header. Check your Vercel Environment Variable formatting.");
+  }
+
   try {
-    return admin.initializeApp({
+    const app = admin.initializeApp({
       credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        projectId,
+        clientEmail,
         privateKey: formattedKey,
       }),
     });
-  } catch (error) {
-    console.error("Firebase Admin Init Error:", error);
+    console.log("✅ Firebase Admin Initialized Successfully");
+    return app;
+  } catch (error: any) {
+    // 🔥 This is the "Exact Error" catcher
+    console.error("🚨 CRITICAL FIREBASE ERROR:", {
+      message: error.message,
+      code: error.code,
+      stack: error.stack?.split('\n')[0] // Just the first line of the stack
+    });
     return null;
   }
 };
 
-// 🔥 The "Universal Getter": Safe for both Build and Runtime
+// Standard Getters
 export const getAdminDb = () => {
   const app = initializeAdmin();
-  if (!app) return null as any; 
-  return admin.firestore();
+  return app ? admin.firestore() : null;
 };
 
 export const getAdminAuth = () => {
   const app = initializeAdmin();
-  if (!app) return null as any;
-  return admin.auth();
+  return app ? admin.auth() : null;
 };
