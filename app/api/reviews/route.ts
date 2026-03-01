@@ -5,6 +5,17 @@ import { getAdminDb } from '@/utils/firebaseAdmin'; // 🔥 Using the safe gette
 
 export async function POST(req: Request) {
   try {
+    // 🛡️ 1. SAFE INITIALIZATION
+    const adminDb = getAdminDb();
+
+    // Guard against null (specifically for build-time or missing key scenarios)
+    if (!adminDb) {
+      return NextResponse.json(
+        { error: 'Database initializing. Please try again.' }, 
+        { status: 503 }
+      );
+    }
+
     const body = await req.json();
     const { productId, userId, userName, rating, comment, imageUrl } = body;
 
@@ -12,28 +23,32 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Data payload incomplete.' }, { status: 400 });
     }
 
-    // 🔥 Safely fetch the DB instance only when the request is made
-    const adminDb = getAdminDb();
-
+    // 2. VERIFY PURCHASE STATUS
     // Pull all "delivered" orders for this specific user
+    // ... (previous code)
+
+    // 2. VERIFY PURCHASE STATUS
     const ordersSnapshot = await adminDb
       .collection('orders')
       .where('user_id', '==', userId)
       .where('status', '==', 'delivered')
       .get();
 
-    // Check if the product is inside any of those delivered orders
     let hasPurchased = false;
-    ordersSnapshot.forEach((doc) => {
+
+    // 🔥 FIX: Use a for...of loop for better Type Inference
+    for (const doc of ordersSnapshot.docs) {
       const order = doc.data();
       const items = order.items || [];
-      // Use standard JS 'some' to check the nested product ID
-      if (items.some((item: any) => item.product.id === productId)) {
+      
+      // Explicitly typing 'item' to avoid 'any' errors
+      if (items.some((item: { product: { id: string } }) => item.product.id === productId)) {
         hasPurchased = true;
+        break; // Stop looking once we find a match
       }
-    });
-
-    // If they didn't buy it, reject the review immediately
+    }
+    
+    // 3. SECURITY REJECTION
     if (!hasPurchased) {
       return NextResponse.json(
         { error: 'Security Alert: You can only review components that have been physically delivered to you.' }, 
@@ -41,7 +56,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // If they did buy it, save the review
+    // 4. PUBLISH REVIEW
     const newReview = {
       product_id: productId,
       user_id: userId,
