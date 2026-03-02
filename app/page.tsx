@@ -199,7 +199,7 @@ export default function Home() {
     );
 
     return () => authListener.subscription.unsubscribe();
-  }, [router]);
+  }, []); // <-- Empty array stops the infinite loop
 
   useEffect(() => {
     if (user?.id) {
